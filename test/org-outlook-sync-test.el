@@ -132,6 +132,92 @@ Stub event rendering and ID persistence, but use real Org buffers and saves."
       (should (equal main-before (org-outlook-test-file-text org-outlook-file)))
       (should (equal other-before (org-outlook-test-file-text refiled))))))
 
+(ert-deftest org-outlook-sync-legacy-ranges-use-complete-overlap ()
+  (let ((org-outlook-local-timezone "America/Chicago"))
+    (dolist (case '(("<2026-09-30 Wed 09:00>--<2026-10-02 Fri 10:00>" t)
+                    ("<2026-10-01 Thu 09:00-10:00>" t)
+                    ("<2026-09-30 Wed 23:00>--<2026-10-01 Thu 00:00>" nil)
+                    ("<2026-10-02 Fri 00:00-01:00>" nil)
+                    ("<2026-10-01 Thu>" t)
+                    ("<2026-09-30 Wed>--<2026-10-01 Thu>" t)
+                    ("<2026-09-30 Wed>" nil)
+                    ("<2026-10-02 Fri>" nil)))
+      (with-temp-buffer
+        (org-mode)
+        (insert "* Legacy event\n" (car case) "\n")
+        (goto-char (point-min))
+        (should (eq (cadr case)
+                    (not (null (org-outlook--entry-in-window-p
+                                "2026-10-01" "2026-10-01")))))))))
+
+(ert-deftest org-outlook-sync-retires-missing-overlapping-legacy-events ()
+  (org-outlook-test-with-files
+    (dolist (case '(("multiday" "<2026-09-30 Wed 09:00>--<2026-10-02 Fri 10:00>")
+                    ("all-day" "<2026-10-01 Thu>")
+                    ("past" "<2026-09-30 Wed 23:00>--<2026-10-01 Thu 00:00>")))
+      (with-current-buffer (get-file-buffer org-outlook-file)
+        (goto-char (point-max))
+        (insert "** Legacy " (car case) "\n:PROPERTIES:\n:ID: "
+                (secure-hash 'sha256 (car case)) "\n:OUTLOOK-ID: " (car case)
+                "\n:OUTLOOK-ID-TYPE: immutable\n:END:\n" (cadr case)
+                "\nPersonal notes for " (car case) "\n")
+        (save-buffer)))
+    (org-outlook--apply-sync-batch (org-outlook-test-batch nil) t)
+    (let ((text (org-outlook-test-file-text org-outlook-file)))
+      (dolist (id '("multiday" "all-day"))
+        (should (string-match-p (concat ":OUTLOOK-RETIRED-ID: " id) text))
+        (should-not (string-match-p (concat ":OUTLOOK-ID: " id) text)))
+      (should (string-match-p ":OUTLOOK-ID: past" text))
+      (dolist (id '("multiday" "all-day" "past"))
+        (should (string-match-p (concat "Personal notes for " id) text))))))
+
+(defmacro org-outlook-test-with-sync-transport (&rest body)
+  "Run BODY with real sync entry points and mocked fetching and persistence."
+  (declare (indent 0))
+  `(let ((org-id-locations (make-hash-table :test #'equal))
+         (org-outlook-full-sync-interval-days nil))
+     (cl-letf (((symbol-function 'org-id-locations-load) #'ignore)
+               ((symbol-function 'org-outlook--sync-state)
+                (lambda () (list :delta "cursor" :start (org-outlook-start)
+                                 :end (org-outlook-end) :timezone org-outlook-local-timezone
+                                 :id-type "immutable" :tenant org-outlook-tenant-id
+                                 :client org-outlook-client-id)))
+               ((symbol-function 'org-outlook-last-full-sync-time) (lambda () nil))
+               ((symbol-function 'org-outlook-retrieve-delta-pages)
+                (lambda (&rest _) (org-outlook-test-batch nil)))
+               ((symbol-function 'org-outlook--apply-sync-batch) #'ignore)
+               ((symbol-function 'org-outlook--commit-sync) #'ignore))
+       ,@body)))
+
+(ert-deftest org-outlook-sync-registers-configured-agenda-file-once ()
+  (dolist (command '(org-outlook-sync org-outlook-full-sync org-outlook-delta-sync-impl))
+    (let ((org-agenda-files '("/tmp/personal-agenda.org"))
+          (org-outlook-file "/tmp/default-outlook.org"))
+      ;; Match use-package: load the package, then apply :config settings.
+      (load "org-outlook" nil t)
+      (should (equal '("/tmp/personal-agenda.org") org-agenda-files))
+      (setq org-outlook-file "/tmp/configured-outlook.org")
+      (org-outlook-test-with-sync-transport
+        (funcall command)
+        (funcall command)
+        (should (equal (list org-outlook-file "/tmp/personal-agenda.org")
+                       org-agenda-files))))))
+
+(ert-deftest org-outlook-sync-preserves-file-backed-agenda-configuration ()
+  (let ((agenda-list (make-temp-file "org-outlook-agenda-")))
+    (unwind-protect
+        (progn
+          (with-temp-file agenda-list (insert "/tmp/personal-agenda.org\n"))
+          (dolist (command '(org-outlook-sync org-outlook-full-sync org-outlook-delta-sync-impl))
+            (let ((org-agenda-files agenda-list)
+                  (org-outlook-file "/tmp/configured-outlook.org"))
+              (org-outlook-test-with-sync-transport
+                (funcall command)
+                (should (equal agenda-list org-agenda-files))
+                (should (equal "/tmp/personal-agenda.org\n"
+                               (org-outlook-test-file-text agenda-list)))))))
+      (delete-file agenda-list))))
+
 (ert-deftest org-outlook-sync-full-reconciles-managed-ids-in-range ()
   (org-outlook-test-with-files
     (org-outlook-test-append-entry org-outlook-file "stale")

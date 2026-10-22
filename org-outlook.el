@@ -598,6 +598,7 @@ transaction ID so a manual retry after an uncertain response is deduplicated."
               (insert (nth 3 edit))))))
       (when (and teams (not join))
         (user-error "Event saved, but Graph returned no Teams join URL; retry updates this event"))
+      (org-outlook--register-agenda-file)
       (message "%s Outlook event" (if id "Updated" "Created"))
       data)))
 
@@ -606,8 +607,6 @@ transaction ID so a manual retry after an uncertain response is deduplicated."
 File-backed agenda lists remain under the user's control."
   (when (listp org-agenda-files)
     (add-to-list 'org-agenda-files org-outlook-file)))
-
-(org-outlook--register-agenda-file)
 
 (add-to-list 'thing-at-point-uri-schemes "msteams://")
 
@@ -1142,13 +1141,17 @@ The destination comes first, including when it does not exist yet."
                             (org-outlook--parse-time to org-outlook-local-timezone))
                     (let ((limit (save-excursion (outline-next-heading) (point))))
                       (forward-line 1)
-                      (when (re-search-forward org-ts-regexp limit t)
+                      (when (re-search-forward org-tsr-regexp limit t)
                         (let* ((parts (cadr (org-timestamp-from-string (match-string-no-properties 0))))
                                (make (lambda (suffix)
                                        (encode-time
                                         0 (or (plist-get parts (intern (concat ":minute-" suffix))) 0)
                                         (or (plist-get parts (intern (concat ":hour-" suffix))) 0)
-                                        (plist-get parts (intern (concat ":day-" suffix)))
+                                        (+ (plist-get parts (intern (concat ":day-" suffix)))
+                                           ;; Org all-day end dates are inclusive.
+                                           (if (and (equal suffix "end")
+                                                    (null (plist-get parts :hour-end)))
+                                               1 0))
                                         (plist-get parts (intern (concat ":month-" suffix)))
                                         (plist-get parts (intern (concat ":year-" suffix)))
                                         (org-outlook--timezone org-outlook-local-timezone)))))
@@ -1418,6 +1421,7 @@ Never establish a baseline without applying its events."
   "Reconcile the current date window using a complete initial delta round."
   (interactive)
   (when org-outlook--sync-running (user-error "Outlook sync is already running"))
+  (org-outlook--register-agenda-file)
   (unless (hash-table-p org-id-locations) (org-id-locations-load))
   (let* ((org-outlook--sync-running t)
          (batch (org-outlook-retrieve-delta-pages nil t)))
@@ -1428,6 +1432,7 @@ Never establish a baseline without applying its events."
 (defun org-outlook-delta-sync-impl ()
   "Apply a fetched delta round and commit its cursor only after local saves."
   (when org-outlook--sync-running (user-error "Outlook sync is already running"))
+  (org-outlook--register-agenda-file)
   (unless (hash-table-p org-id-locations) (org-id-locations-load))
   (let* ((org-outlook--sync-running t)
          (batch (org-outlook-retrieve-delta-pages)))
@@ -1441,6 +1446,7 @@ Rebuild the view when its date range changes or its cursor expires.
 Other fetch or local errors propagate without advancing the saved cursor."
   (interactive "P")
   (when org-outlook--sync-running (user-error "Outlook sync is already running"))
+  (org-outlook--register-agenda-file)
   (org-id-locations-load)
   (let* ((state (org-outlook--sync-state))
          (last-full (org-outlook-last-full-sync-time))

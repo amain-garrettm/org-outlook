@@ -264,7 +264,8 @@ Installing with [[https://framagit.org/steckerhalter/quelpa][Quelpa]] is easy:
   change identity, as described in
   [[https://learn.microsoft.com/en-us/graph/outlook-immutable-id][Microsoft's immutable-ID documentation]].
 
-+ *Agenda files:* List-based =org-agenda-files= includes the Outlook file on load.
++ *Agenda files:* List-based =org-agenda-files= includes the configured Outlook
+  file when syncing or saving a calendar event, after your configuration is set.
   If =org-agenda-files= names a file containing your agenda list, add the Outlook
   path to that file yourself; the package preserves this configuration.
 

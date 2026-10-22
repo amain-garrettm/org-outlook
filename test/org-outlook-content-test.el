@@ -362,6 +362,16 @@
         (let ((payload (json-read-from-string (plist-get (nth 2 (car calls)) :body))))
           (should (equal "MEETING planning" (alist-get 'subject payload))))))))
 
+(ert-deftest org-outlook-capture-registers-configured-agenda-file ()
+  (dolist (agenda '(nil "/tmp/personal-agenda-list"))
+    (let ((org-agenda-files agenda)
+          (org-outlook-file "/tmp/configured-outlook.org"))
+      (org-outlook-test-with-capture-entry "no"
+        (org-outlook-test-with-responses (list (org-outlook-test-calendar-response))
+          (org-outlook-calendar-create-or-update-event)
+          (should (equal (if (stringp agenda) agenda (list org-outlook-file))
+                         org-agenda-files)))))))
+
 (ert-deftest org-outlook-capture-missing-join-url-keeps-created-id ()
   (org-outlook-test-with-capture-entry "yes"
     (org-outlook-test-with-responses
