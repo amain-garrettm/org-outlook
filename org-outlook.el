@@ -1116,14 +1116,21 @@ FULL also records full-sync completion in the same cache write."
      nil)))
 
 (defun org-outlook--sync-files ()
-  "Return the destination and registered Org ID files, including refilings."
-  (delete-dups
-   (mapcar #'expand-file-name
-           (append (list org-outlook-file) org-id-files
-                   (when (hash-table-p org-id-locations)
-                     (let (files)
-                       (maphash (lambda (_id file) (push file files)) org-id-locations)
-                       files))))))
+  "Return the destination and registered Org ID files, including refilings.
+Deduplicate canonical paths while keeping the first spelling of each file.
+The destination comes first, including when it does not exist yet."
+  (let ((seen (make-hash-table :test #'equal)) files)
+    (dolist (path (append (list org-outlook-file) org-id-files
+                         (when (hash-table-p org-id-locations)
+                           (let (locations)
+                             (maphash (lambda (_id file) (push file locations)) org-id-locations)
+                             locations))))
+      (let* ((file (expand-file-name path))
+             (canonical (file-truename file)))
+        (unless (gethash canonical seen)
+          (puthash canonical t seen)
+          (push file files))))
+    (nreverse files)))
 
 (defun org-outlook--entry-in-window-p (start end)
   "Test this entry's server instants, or its legacy timestamp, against the window."

@@ -70,6 +70,68 @@ Stub event rendering and ID persistence, but use real Org buffers and saves."
   "Read FILE from disk so tests verify saved state."
   (with-temp-buffer (insert-file-contents file) (buffer-string)))
 
+(ert-deftest org-outlook-sync-file-aliases-update-the-entry-once ()
+  (org-outlook-test-with-files
+    (org-outlook-test-append-entry org-outlook-file "meeting")
+    (let* ((target org-outlook-file)
+           (alias (expand-file-name "alias.org" directory))
+           (org-outlook-file alias)
+           (org-id-files (list target refiled alias))
+           (find-file-visit-truename t)
+           (planner (symbol-function 'org-outlook--entry-edits))
+           (planned 0))
+      (make-symbolic-link target alias)
+      (puthash (secure-hash 'sha256 "meeting") target org-id-locations)
+      (should (equal (list alias refiled) (org-outlook--sync-files)))
+      (cl-letf (((symbol-function 'org-outlook--entry-edits)
+                 (lambda (&rest args) (cl-incf planned) (apply planner args))))
+        (org-outlook--apply-sync-batch
+         (org-outlook-test-batch (list (org-outlook-test-event "meeting"))) nil))
+      (should (= 1 planned))
+      (with-current-buffer (get-file-buffer target)
+        (goto-char (point-min))
+        (re-search-forward "^\\*\\* MEETING")
+        (org-back-to-heading)
+        (should (equal "new" (org-entry-get nil "CHANGEKEY")))
+        (should (= 1 (length (org-outlook--managed-entries
+                             (current-buffer) "2026-10-01" "2026-12-31"))))))))
+
+(ert-deftest org-outlook-sync-missing-destination-through-directory-alias ()
+  (org-outlook-test-with-files
+    (let* ((target-directory (expand-file-name "target" directory))
+           (alias-directory (expand-file-name "linked" directory))
+           (target (expand-file-name "new.org" target-directory))
+           (org-outlook-file (expand-file-name "new.org" alias-directory))
+           (org-id-files (list target refiled)))
+      (make-directory target-directory)
+      (make-symbolic-link target-directory alias-directory)
+      (unwind-protect
+          (progn
+            (should-not (file-exists-p org-outlook-file))
+            (should (equal (list org-outlook-file refiled) (org-outlook--sync-files)))
+            (org-outlook--apply-sync-batch
+             (org-outlook-test-batch (list (org-outlook-test-event "created"))) t)
+            (should (file-exists-p target))
+            (should (string-match-p ":OUTLOOK-ID: created"
+                                    (org-outlook-test-file-text target))))
+        (let ((buffer (find-buffer-visiting org-outlook-file)))
+          (when buffer
+            (with-current-buffer buffer
+              (set-buffer-modified-p nil)
+              (kill-buffer))))))))
+
+(ert-deftest org-outlook-sync-real-duplicate-entries-still-abort ()
+  (org-outlook-test-with-files
+    (org-outlook-test-append-entry org-outlook-file "duplicate")
+    (org-outlook-test-append-entry refiled "duplicate")
+    (let ((main-before (org-outlook-test-file-text org-outlook-file))
+          (other-before (org-outlook-test-file-text refiled)))
+      (should-error
+       (org-outlook--apply-sync-batch
+        (org-outlook-test-batch (list (org-outlook-test-event "duplicate"))) nil))
+      (should (equal main-before (org-outlook-test-file-text org-outlook-file)))
+      (should (equal other-before (org-outlook-test-file-text refiled))))))
+
 (ert-deftest org-outlook-sync-full-reconciles-managed-ids-in-range ()
   (org-outlook-test-with-files
     (org-outlook-test-append-entry org-outlook-file "stale")
