@@ -289,6 +289,79 @@
           (should-not (assq 'body payload))
           (should-not (assq 'categories payload)))))))
 
+(defmacro org-outlook-test-with-imported-subject (subject &rest body)
+  "Run BODY on a real imported event with SUBJECT and a mocked update."
+  (declare (indent 1))
+  `(let ((event (org-outlook-test-event "meeting")))
+     (setf (alist-get 'subject event) ,subject)
+     (with-temp-buffer
+       (org-mode)
+       (insert (org-outlook-build-element event))
+       (goto-char (point-min))
+       (org-outlook-test-with-responses
+           (list (org-outlook-test-response 200 (json-encode event)))
+         ,@body))))
+
+(ert-deftest org-outlook-update-imported-subject-ignores-generated-status ()
+  (dolist (keywords '(((sequence "TODO" "|" "DONE"))
+                      ((sequence "TODO" "MEETING" "REQUEST" "|" "DONE" "CANCELLED"))))
+    (let ((org-todo-keywords keywords))
+      (dolist (subject '("Project review" "MEETING planning" "REQUEST access" "CANCELLED plans"))
+        (org-outlook-test-with-imported-subject subject
+          (org-outlook-calendar-create-or-update-event)
+          (let ((payload (json-read-from-string (plist-get (nth 2 (car calls)) :body))))
+            (should (eq 'patch (caar calls)))
+            (should (equal subject (alist-get 'subject payload)))))))))
+
+(ert-deftest org-outlook-update-imported-subject-preserves-explicit-renames ()
+  (dolist (keywords '(((sequence "TODO" "|" "DONE"))
+                      ((sequence "TODO" "MEETING" "REQUEST" "|" "DONE" "CANCELLED"))))
+    (let ((org-todo-keywords keywords))
+      (dolist (rename '("New meeting title" "TODO [#A] New meeting title :project:"))
+        (org-outlook-test-with-imported-subject "Project review"
+          (delete-region (line-beginning-position) (line-end-position))
+          (insert "** " rename)
+          (beginning-of-line)
+          (org-outlook-calendar-create-or-update-event)
+          (let ((payload (json-read-from-string (plist-get (nth 2 (car calls)) :body))))
+            (should (equal "New meeting title" (alist-get 'subject payload))))))))
+  (let ((org-todo-keywords '((sequence "TODO" "|" "DONE"))))
+    (dolist (rename '("MEETING planning" "REQUEST access" "CANCELLED plans"))
+      (org-outlook-test-with-imported-subject "Project review"
+        (delete-region (line-beginning-position) (line-end-position))
+        (insert "** " rename)
+        (beginning-of-line)
+        (org-outlook-calendar-create-or-update-event)
+        (let ((payload (json-read-from-string (plist-get (nth 2 (car calls)) :body))))
+          (should (equal rename (alist-get 'subject payload))))))))
+
+(ert-deftest org-outlook-update-unchanged-import-keeps-remote-rename ()
+  (dolist (personal-todo '(nil t))
+    (org-outlook-test-with-imported-subject "Original subject"
+      (when personal-todo
+        (let ((heading (org-get-heading t nil t t)))
+          (delete-region (line-beginning-position) (line-end-position))
+          (insert "** TODO [#A] " heading " :personal:")
+          (beginning-of-line)))
+      ;; Sync preserves the parent heading while updating the server properties.
+      (org-entry-put nil "OUTLOOK-SUBJECT" "Renamed remotely")
+      (org-entry-put nil "OUTLOOK-STATUS" "REQUEST")
+      (org-outlook-calendar-create-or-update-event)
+      (let ((payload (json-read-from-string (plist-get (nth 2 (car calls)) :body))))
+        (should (equal "Renamed remotely" (alist-get 'subject payload)))))))
+
+(ert-deftest org-outlook-update-older-import-recognizes-exact-status-prefix ()
+  (dolist (status '("MEETING" "REQUEST" "CANCELLED"))
+    (let ((org-todo-keywords '((sequence "TODO" "|" "DONE"))))
+      (org-outlook-test-with-imported-subject "MEETING planning"
+        (org-entry-delete nil "OUTLOOK-GENERATED-HEADING")
+        (delete-region (line-beginning-position) (line-end-position))
+        (insert "** " status " MEETING planning")
+        (beginning-of-line)
+        (org-outlook-calendar-create-or-update-event)
+        (let ((payload (json-read-from-string (plist-get (nth 2 (car calls)) :body))))
+          (should (equal "MEETING planning" (alist-get 'subject payload))))))))
+
 (ert-deftest org-outlook-capture-missing-join-url-keeps-created-id ()
   (org-outlook-test-with-capture-entry "yes"
     (org-outlook-test-with-responses

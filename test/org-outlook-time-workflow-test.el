@@ -73,6 +73,67 @@
                                                     "2026-07-15T09:00:00" "2026-07-15T10:00:00")
                     :type 'org-outlook-graph-error))))
 
+(ert-deftest org-outlook-capture-busy-attendees-use-one-validated-response ()
+  (dolist (choice '(?c ?e ?q))
+    (org-outlook-test-with-capture-entry "no"
+      (let* ((event (org-outlook-test-event "busy"))
+             (data `((value . ,(vector
+                               `((scheduleId . "one@example.com")
+                                 (scheduleItems . ,(vector
+                                                   `((status . "busy")
+                                                     (start . ,(alist-get 'start event))
+                                                     (end . ,(alist-get 'end event))))))
+                               '((scheduleId . "two@example.com") (scheduleItems . []))))))
+             prompt killed)
+        (org-outlook-test-with-responses
+            (list (org-outlook-test-response 200 (json-encode data))
+                  ;; The old second fetch could replace conflicts with unknown data.
+                  (org-outlook-test-response 200 "{\"value\":[]}"))
+          (cl-letf (((symbol-function 'read-char-choice)
+                     (lambda (text &rest _) (setq prompt text) choice))
+                    ((symbol-function 'org-capture-kill) (lambda () (setq killed t))))
+            (if (eq choice ?c)
+                (should (org-outlook-check-capture-availability))
+              (should-error (org-outlook-check-capture-availability)))
+            (should (string-match-p "one@example.com" (or prompt "")))
+            (should (eq (eq choice ?q) killed))
+            (should (= 1 (length calls)))
+            (should (equal org-outlook-schedule-url (nth 1 (car calls))))))))))
+
+(ert-deftest org-outlook-capture-free-attendees-proceed-without-prompt ()
+  (org-outlook-test-with-capture-entry "no"
+    (org-outlook-test-with-responses
+        (list (org-outlook-test-response
+               200 (json-encode
+                    '((value . [((scheduleId . "one@example.com") (scheduleItems . []))
+                                ((scheduleId . "two@example.com") (scheduleItems . []))])))))
+      (cl-letf (((symbol-function 'read-char-choice)
+                 (lambda (&rest _) (ert-fail "Unexpected conflict prompt"))))
+        (should (org-outlook-check-capture-availability))
+        (should (= 1 (length calls)))))))
+
+(ert-deftest org-outlook-capture-unknown-availability-prevents-calendar-write ()
+  (dolist (data '(nil
+                  ((value . []))
+                  ((value . [((scheduleId . "one@example.com") (scheduleItems . []))]))
+                  ((value . [((scheduleId . "one@example.com") (error . ((code . "unknown"))))
+                             ((scheduleId . "two@example.com") (scheduleItems . []))]))
+                  ((value . [((scheduleId . "one@example.com"))
+                             ((scheduleId . "two@example.com") (scheduleItems . []))]))
+                  ((value . [((scheduleId . "one@example.com") (scheduleItems . []))
+                             ((scheduleId . "one@example.com") (scheduleItems . []))]))))
+    (org-outlook-test-with-capture-entry "no"
+      (let ((org-capture-mode t)
+            (org-note-abort nil))
+        (org-outlook-test-with-responses
+            (list (org-outlook-test-response 200 (json-encode data)))
+          (cl-letf (((symbol-function 'org-capture-get) (lambda (&rest _) t))
+                    ((symbol-function 'read-char-choice)
+                     (lambda (&rest _) (ert-fail "Unexpected conflict prompt"))))
+            (should-error (org-outlook-finalize-capture) :type 'org-outlook-graph-error)
+            (should (= 1 (length calls)))
+            (should (equal org-outlook-schedule-url (nth 1 (car calls))))))))))
+
 (ert-deftest org-outlook-identity-migration-preserves-links-and-notes ()
   (org-outlook-test-with-native-files
     (org-outlook-test-install-native-event refiled "mutable")

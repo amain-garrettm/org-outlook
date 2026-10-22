@@ -505,6 +505,27 @@ across a DST transition.  Explicit offsets always identify an instant."
       value)))
 
 
+(defun org-outlook--calendar-subject ()
+  "Return the intended calendar subject of the current entry.
+An unchanged imported heading uses the latest server subject.  Otherwise
+use the edited title, excluding personal TODO state, priority, and tags.
+Older imports lack a recorded generated heading, so recognize their
+status prefix only when the remaining text exactly matches the subject."
+  (let* ((heading (org-get-heading t nil t t))
+         (title (org-get-heading t t t t))
+         (subject (org-entry-get nil "OUTLOOK-SUBJECT"))
+         (generated (org-entry-get nil "OUTLOOK-GENERATED-HEADING")))
+    (if (and (org-entry-get nil "OUTLOOK-ID") subject
+             (or (equal heading subject)
+                 (equal heading generated)
+                 (equal title generated)
+                 (and (not generated)
+                      (member heading
+                              (mapcar (lambda (status) (concat status " " subject))
+                                      '("MEETING" "REQUEST" "CANCELLED"))))))
+        subject
+      title)))
+
 (defun org-outlook-calendar-create-or-update-event ()
   "Create or update the current calendar event and record its returned ID.
 Only new events export their capture body.  Updates never upload personal
@@ -512,7 +533,7 @@ notes or overwrite Graph's online-meeting body.  New events use a stable
 transaction ID so a manual retry after an uncertain response is deduplicated."
   (interactive)
   (org-back-to-heading t)
-  (let* ((title (org-get-heading t t t t))
+  (let* ((title (org-outlook--calendar-subject))
          (meeting-time (org-entry-get nil "MEETING-TIME"))
          (start (if meeting-time (org-outlook-start-time-from-timestamp meeting-time)
                   (org-entry-get nil "OUTLOOK-START")))
@@ -705,6 +726,7 @@ File-backed agenda lists remain under the user's control."
             (org-outlook--one-line (alist-get 'subject event)) "\n")
     (goto-char (point-min))
     (org-outlook--put-properties (org-outlook--event-properties event))
+    (org-entry-put nil "OUTLOOK-GENERATED-HEADING" (org-get-heading t nil t t))
     (org-entry-put nil "OUTLOOK-SYNC-VERSION" "1")
     (goto-char (point-max))
     (insert (org-outlook--event-section event 3))
@@ -799,33 +821,25 @@ Returns t to proceed with event creation, nil if user wants to edit."
         (let* ((invitees (split-string invitees-str))
                (start-time (org-outlook-start-time-from-timestamp meeting-time-str))
                (end-time (org-outlook-end-time-from-timestamp meeting-time-str))
-               (all-available (org-outlook-persons-available-p invitees start-time end-time)))
-          (if all-available
-              (progn
-                (message "✓ All attendees are available")
-                t)
-            ;; Some people are not available - get details and prompt user
-            (let* ((availability-data (org-outlook-check-availability invitees start-time end-time))
-                   (schedules (append (assoc-default 'value availability-data) nil))
-                   (busy-people (org-outlook-get-busy-attendees schedules start-time end-time)))
-              (if busy-people
-                  (let ((choice (read-char-choice
-                                (format "⚠️  Some attendees are busy: %s\n\n(c)ontinue anyway, (e)dit capture, (q)uit capture? "
-                                        (mapconcat 'identity busy-people ", "))
-                                '(?c ?e ?q))))
-                    (cond
-                     ((eq choice ?c)
-                      (message "Creating meeting despite conflicts...")
-                      t)
-                     ((eq choice ?e)
-                      (message "Please edit and finalize again")
-                      (error "Availability conflicts - please edit and try again"))
-                     ((eq choice ?q)
-                      (org-capture-kill)
-                      (error "Capture cancelled"))))
-                (progn
-                  (message "✓ All attendees are available")
-                  t)))))
+               (schedules (org-outlook--availability-schedules invitees start-time end-time))
+               (busy-people (org-outlook-get-busy-attendees schedules start-time end-time)))
+          (if busy-people
+              (let ((choice (read-char-choice
+                             (format "⚠️  Some attendees are busy: %s\n\n(c)ontinue anyway, (e)dit capture, (q)uit capture? "
+                                     (mapconcat 'identity busy-people ", "))
+                             '(?c ?e ?q))))
+                (cond
+                 ((eq choice ?c)
+                  (message "Creating meeting despite conflicts...")
+                  t)
+                 ((eq choice ?e)
+                  (message "Please edit and finalize again")
+                  (error "Availability conflicts - please edit and try again"))
+                 ((eq choice ?q)
+                  (org-capture-kill)
+                  (error "Capture cancelled"))))
+            (message "✓ All attendees are available")
+            t))
       ;; No invitees or meeting time specified - proceed
       t)))
 
@@ -1523,9 +1537,11 @@ AVAILABILITY-INTERVAL defaults to 30 minutes.  Signal on Graph failure."
                         (org-outlook--event-time datetime))
                       (org-outlook--timezone org-outlook-local-timezone)))
 
-(defun org-outlook-persons-available-p (emails start-time end-time)
-  "Return t only when every requested EMAILS schedule is known and free.
-Unknown, missing, or failed schedules signal instead of implying availability."
+(defun org-outlook--availability-schedules (emails start-time end-time)
+  "Fetch and validate EMAILS schedules between START-TIME and END-TIME.
+Unknown, missing, or failed schedules signal instead of implying availability.
+Return the validated schedules so callers can inspect conflicts without
+fetching a second, potentially different response."
   (let* ((emails (if (listp emails) emails (list emails)))
          (data (org-outlook-check-availability emails start-time end-time))
          (schedules (append (alist-get 'value data) nil)))
@@ -1540,7 +1556,14 @@ Unknown, missing, or failed schedules signal instead of implying availability."
                                                (vectorp (alist-get 'scheduleItems s))))
                               schedules))
       (signal 'org-outlook-graph-error '("Availability is unknown for one or more attendees")))
-    (not (org-outlook-get-busy-attendees schedules start-time end-time))))
+    schedules))
+
+(defun org-outlook-persons-available-p (emails start-time end-time)
+  "Return t only when every requested EMAILS schedule is known and free.
+Unknown, missing, or failed schedules signal instead of implying availability."
+  (not (org-outlook-get-busy-attendees
+        (org-outlook--availability-schedules emails start-time end-time)
+        start-time end-time)))
 
 (defun org-outlook-i-am-available-p (start-time end-time)
   "Check if you are available between START-TIME and END-TIME.
