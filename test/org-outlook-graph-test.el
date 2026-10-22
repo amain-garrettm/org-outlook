@@ -118,13 +118,16 @@ Expose CALLS and REFRESHES to BODY.  No network or token cache is used."
     (org-outlook-test-with-responses
         (list (org-outlook-test-response
                200 (json-encode `(("value" . []) ("@odata.nextLink" . ,next))))
-              (org-outlook-test-response 200 "{\"@odata.deltaLink\":\"delta\",\"value\":[]}"))
+              (org-outlook-test-response 200 "{\"@odata.deltaLink\":\"https://graph.microsoft.com/delta\",\"value\":[]}"))
       (cl-letf (((symbol-function 'org-outlook-last-delta) (lambda () nil))
                 ((symbol-function 'org-outlook-set-token-field)
                  (lambda (&rest args) (setq saved args))))
-        (should-not (org-outlook-retrieve-delta-pages))
+        (let ((batch (org-outlook-retrieve-delta-pages)))
+          (should-not (org-outlook-sync-batch-events batch))
+          (should (equal "https://graph.microsoft.com/delta"
+                         (org-outlook-sync-batch-delta batch))))
         (should (equal next (nth 1 (car calls))))
-        (should (equal '("delta" (:delta "delta") (:noclobber "noclobber")) saved))))))
+        (should-not saved)))))
 
 (ert-deftest org-outlook-graph-failed-page-does-not-return-partial-events ()
   (org-outlook-test-with-responses
@@ -172,10 +175,10 @@ Expose CALLS and REFRESHES to BODY.  No network or token cache is used."
     (should-error (org-outlook-retrieve-pages) :type 'org-outlook-graph-error)))
 
 (ert-deftest org-outlook-graph-failed-full-sync-is-not-recorded ()
-  (let (recorded)
+  (let ((org-id-locations (make-hash-table :test #'equal)) recorded)
     (org-outlook-test-with-responses (list (org-outlook-test-http-error 403))
-      (cl-letf (((symbol-function 'org-outlook-record-full-sync)
-                 (lambda () (setq recorded t))))
+      (cl-letf (((symbol-function 'org-outlook--commit-sync)
+                 (lambda (&rest _) (setq recorded t))))
         (should-error (org-outlook-full-sync) :type 'org-outlook-graph-error)
         (should-not recorded)))))
 

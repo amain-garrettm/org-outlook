@@ -34,6 +34,7 @@
 (require 'cl-lib)
 (require 'json)
 (require 'url-parse)
+(require 'org-id)
 (require 'plz)
 (require 'org-msg)
 (require 'plstore)
@@ -812,14 +813,15 @@ Only values are percent-encoded; parameter names are kept literal."
      (concat (car pair) "=" (url-hexify-string (cdr pair))))
    params "&"))
 
-(defun org-outlook-retrieve-events-delta (&optional nextlink)
-  "Retrieve a delta page, following NEXTLINK verbatim when supplied."
+(defun org-outlook-retrieve-events-delta (&optional nextlink start end)
+  "Retrieve a delta page, following NEXTLINK verbatim when supplied.
+START and END fix the dates of an initial round even across midnight."
   (org-outlook--graph-data
    'get (or nextlink
             (concat org-outlook-events-delta-url "?"
                     (org-outlook--build-query-string
-                     `(("startDateTime" . ,(concat (org-outlook-start) "T00:00:00.000Z"))
-                       ("endDateTime" . ,(concat (org-outlook-end) "T23:59:59.000Z"))))))
+                     `(("startDateTime" . ,(concat (or start (org-outlook-start)) "T00:00:00.000Z"))
+                       ("endDateTime" . ,(concat (or end (org-outlook-end)) "T23:59:59.000Z"))))))
    :headers `(("Prefer" . ,(format "outlook.timezone=\"%s\"" org-outlook-local-timezone)))))
 
 (defun org-outlook-last-delta ()
@@ -838,24 +840,33 @@ An empty value array is a valid page; a missing value is a protocol error."
     (signal 'org-outlook-graph-error '("Invalid Graph collection response")))
   (append (alist-get 'value data) nil))
 
-(defun org-outlook-retrieve-delta-pages (&optional nextlink)
-  "Retrieve every delta page, following continuation URLs verbatim.
-Signal on failed or malformed pages rather than returning partial results."
-  (let ((url (or nextlink (org-outlook-last-delta))) seen chunks delta done)
+(cl-defstruct org-outlook-sync-batch
+  "A fetched round of changes whose DELTA must not be saved before application."
+  events delta start end)
+
+(defun org-outlook-retrieve-delta-pages (&optional nextlink initial)
+  "Fetch a complete delta round without changing the saved cursor.
+Return an `org-outlook-sync-batch'.  INITIAL starts a new calendar view;
+otherwise NEXTLINK or the saved cursor continues the existing view."
+  (let* ((start (org-outlook-start))
+         (end (org-outlook-end))
+         (url (unless initial (or nextlink (org-outlook-last-delta))))
+         seen chunks delta done)
     (while (not done)
       (when (member url seen)
         (signal 'org-outlook-graph-error '("Repeated Graph continuation URL")))
       (push url seen)
-      (let ((data (org-outlook-retrieve-events-delta url)))
+      (let ((data (org-outlook-retrieve-events-delta url start end)))
         (push (org-outlook--graph-page-events data) chunks)
         (setq delta (alist-get '@odata.deltaLink data)
               url (alist-get '@odata.nextLink data))
-        (cond ((and (stringp delta) (not url)) (setq done t))
-              ((or (not (stringp url)) delta)
+        (cond ((and (stringp delta) (not (string-empty-p delta))
+                    (org-outlook--graph-url-p delta) (not url))
+               (setq done t))
+              ((or (not (stringp url)) (string-empty-p url) delta)
                (signal 'org-outlook-graph-error '("Invalid Graph delta continuation"))))))
-    ;; Persist only after every page has been retrieved successfully.
-    (org-outlook-set-token-field "delta" `(:delta ,delta) '(:noclobber "noclobber"))
-    (apply #'append (nreverse chunks))))
+    (make-org-outlook-sync-batch :events (apply #'append (nreverse chunks))
+                                :delta delta :start start :end end)))
 
 (defun org-outlook-retrieve-events (&optional nextlink)
   "Retrieve a calendar page, following NEXTLINK verbatim when supplied."
@@ -882,170 +893,261 @@ Signal on failed or malformed pages rather than returning partial results."
           (signal 'org-outlook-graph-error '("Invalid Graph continuation URL")))))
     (apply #'append (nreverse chunks))))
 
-(defun org-outlook-insert-or-update (event)
-  (let* ((outlook-id (assoc-default 'id event))
-	 (removed (assoc-default '@removed event))
- 	 (changekey (assoc-default 'changeKey event))
- 	 (id (secure-hash 'sha256 outlook-id))
- 	 (location (with-temp-buffer (org-id-find id)))
-	 (file (car location))
-	 (pos (cdr location)))
-    (message "Processing event: outlook-id=%s, id=%s, pos=%s"
-             (substring outlook-id 0 20) (substring id 0 20) pos)
-    (if removed
-	(org-outlook-delete-by-id id)
-      (if pos ; the event exists
-	  (with-current-buffer (or (get-file-buffer file)(find-file-noselect file))
-	    (unless (derived-mode-p 'org-mode)
-	      (let ((org-inhibit-startup t)) (org-mode)))
-	    (goto-char pos)
-;	    (message "At position %d in buffer %s (mode: %s)" pos (buffer-name) major-mode)
-	    (let*
-		((element (org-element-at-point))
-;		 (_ (message (format "%s" element)))
-		 (change (org-outlook-get-appointment-property "CHANGEKEY"))
-		 (begin (org-element-property :begin element))
-		 (end (org-element-property :end element)))
-	     ; (message "Element parsed: begin=%s end=%s" begin end)
-	      ;; Check if we found a valid element with begin/end positions
-	      (if (and begin end (not (string= changekey change)))
-		  (progn
-		    (message (concat "Updating event: " outlook-id))
-		    (delete-region begin end)
-		    (insert (org-outlook-build-element event))
-		    (insert "\n")
-		    (save-buffer)
-		    ;; Refresh org-id cache since file positions changed
-		    (org-id-update-id-locations (list (buffer-file-name))))
-		;; If element is invalid (stale org-id cache), treat as new event
-		(when (not (and begin end))
-		  (message (concat "Stale org-id cache for: " outlook-id " - reinserting"))
-		  (with-current-buffer (or (get-file-buffer org-outlook-file)(find-file-noselect org-outlook-file))
-		    (goto-char (point-max))
-		    (insert (org-outlook-build-element event))
-		    (insert "\n")
-		    (save-buffer))))))
-        (with-current-buffer (or (get-file-buffer org-outlook-file)(find-file-noselect org-outlook-file))
-	  (unless (derived-mode-p 'org-mode)
-	    (let ((org-inhibit-startup t)) (org-mode)))
-	  (message "Inserting new event")
-	  (goto-char (point-max))
-	  (unless (bolp) (insert "\n"))
-	  (when (org-at-heading-p) (outline-next-heading))
-	  (insert (org-outlook-build-element event))
-	  (insert "\n")
-	  (save-buffer)
-	  ;; Refresh org-id cache since file positions changed
-	  (org-id-update-id-locations (list (buffer-file-name))))))))
-
-
 (defvar org-outlook-full-sync-interval-days 7
   "Number of days between full syncs for validation.
-Set to nil to disable automatic full syncs.")
+Set to nil to disable periodic full syncs.  A changed date window always
+requires a new full sync because Graph cursors encode a fixed date range.")
+
+(defvar org-outlook--sync-running nil
+  "Non-nil while a sync is fetching, applying, or committing changes.")
+
+(defun org-outlook--sync-state ()
+  "Read the committed cursor and its calendar window."
+  (let ((cache (plstore-open (expand-file-name org-outlook-token-cache-file))))
+    (unwind-protect
+        (cdr (plstore-get cache "delta"))
+      (plstore-close cache))))
 
 (defun org-outlook-last-full-sync-time ()
-  "Get timestamp of last full sync."
-  (let* ((cache (plstore-open (expand-file-name org-outlook-token-cache-file)))
-         (time-str (plist-get (cdr (plstore-get cache "last-full-sync")) :time)))
-    (plstore-close cache)
-    (when time-str
-      (parse-iso8601-time-string time-str))))
+  "Return the time of the last committed full synchronization."
+  (let ((time-str (plist-get (org-outlook--sync-state) :full-sync)))
+    (when time-str (parse-iso8601-time-string time-str))))
 
-(defun org-outlook-record-full-sync ()
-  "Record timestamp of full sync completion."
-  (org-outlook-set-token-field "last-full-sync"
-                               `(:time ,(format-time-string "%Y-%m-%dT%H:%M:%S" (current-time)))
-                               '()))
+(defun org-outlook--commit-sync (batch full)
+  "Commit BATCH after local saves and ID indexing succeed.
+FULL also records full-sync completion in the same cache write."
+  (let* ((previous (org-outlook--sync-state))
+         (full-time (if full (format-time-string "%Y-%m-%dT%H:%M:%S%z")
+                      (plist-get previous :full-sync))))
+    (org-outlook-set-token-field
+     "delta" (list :delta (org-outlook-sync-batch-delta batch)
+                   :start (org-outlook-sync-batch-start batch)
+                   :end (org-outlook-sync-batch-end batch)
+                   :full-sync full-time)
+     nil)))
+
+(defun org-outlook--sync-files ()
+  "Return the destination and registered Org ID files, including refilings."
+  (delete-dups
+   (mapcar #'expand-file-name
+           (append (list org-outlook-file) org-id-files
+                   (when (hash-table-p org-id-locations)
+                     (let (files)
+                       (maphash (lambda (_id file) (push file files)) org-id-locations)
+                       files))))))
+
+(defun org-outlook--entry-in-window-p (start end)
+  "At a headline, test its active timestamp against dates START and END.
+Missing timestamps do not authorize pruning.  Only the headline's own
+section is inspected, so timestamps in child headings do not qualify it."
+  (save-excursion
+    (let ((limit (save-excursion (outline-next-heading) (point))))
+      (forward-line 1)
+      (when (re-search-forward org-ts-regexp limit t)
+        (let* ((value (match-string-no-properties 0))
+               (parts (and value (cadr (org-timestamp-from-string value))))
+               (from (and parts
+                          (encode-time 0 (or (plist-get parts :minute-start) 0)
+                                       (or (plist-get parts :hour-start) 0)
+                                       (plist-get parts :day-start)
+                                       (plist-get parts :month-start)
+                                       (plist-get parts :year-start)
+                                       org-outlook-local-timezone)))
+               (to (and parts
+                        (encode-time 0 (or (plist-get parts :minute-end) 0)
+                                     (or (plist-get parts :hour-end) 0)
+                                     (plist-get parts :day-end)
+                                     (plist-get parts :month-end)
+                                     (plist-get parts :year-end)
+                                     org-outlook-local-timezone))))
+          (and from to
+               (not (time-less-p to (parse-iso8601-time-string (concat start "T00:00:00Z"))))
+               (not (time-less-p (parse-iso8601-time-string (concat end "T23:59:59Z")) from))))))))
+
+(defun org-outlook--managed-entries (buffer start end)
+  "Index verifiably imported headlines in BUFFER for dates START and END."
+  (with-current-buffer buffer
+    (save-restriction
+      (widen)
+      (save-excursion
+        (goto-char (point-min))
+        (let (entries)
+          (org-map-entries
+           (lambda ()
+             (let ((remote (org-entry-get nil "OUTLOOK-ID"))
+                   (id (org-entry-get nil "ID")))
+               (when (and remote id (equal id (secure-hash 'sha256 remote)))
+                 (push (list :id remote :begin (point)
+                             :end (save-excursion (org-end-of-subtree t t) (point))
+                             :change (org-entry-get nil "CHANGEKEY")
+                             :in-window (org-outlook--entry-in-window-p start end))
+                       entries))))
+           nil nil)
+          entries)))))
+
+(defun org-outlook--apply-sync-batch (batch full)
+  "Apply BATCH and reconcile missing IDs when FULL is non-nil.
+Render and plan every edit before changing buffers.  Reject unsaved local
+edits in affected buffers.  Roll back buffer edits on application failures.
+Save all affected files and the ID index before returning to the caller.
+The caller commits the cursor last; an interrupted disk save can therefore
+be retried safely from the previous cursor."
+  (let ((events (make-hash-table :test #'equal))
+        (locals (make-hash-table :test #'equal))
+        (start (org-outlook-sync-batch-start batch))
+        (end (org-outlook-sync-batch-end batch))
+        edits buffers groups saved accepted)
+    ;; Delta rounds can mention an ID more than once; the final version wins.
+    (dolist (event (org-outlook-sync-batch-events batch))
+      (let ((id (alist-get 'id event)))
+        (unless (and (stringp id) (not (string-empty-p id)))
+          (signal 'org-outlook-graph-error '("Event has no valid Graph ID")))
+        (puthash id event events)))
+    (dolist (file (org-outlook--sync-files))
+      (when (or (equal file (expand-file-name org-outlook-file)) (file-exists-p file))
+        (let ((buffer (find-file-noselect file)))
+          (with-current-buffer buffer
+            (unless (derived-mode-p 'org-mode) (org-mode)))
+          (dolist (entry (org-outlook--managed-entries buffer start end))
+            (let* ((id (plist-get entry :id))
+                   (event (gethash id events))
+                   (remove (and (plist-get entry :in-window)
+                                (or (alist-get '@removed event)
+                                    (and full (not event))))))
+              (when (gethash id locals)
+                (error "Duplicate managed Outlook ID in local files: %s" id))
+              (puthash id (cons buffer entry) locals)
+              (cond
+               (remove
+                (push (list buffer (plist-get entry :begin) (plist-get entry :end) "") edits))
+               ((and event (not (alist-get '@removed event))
+                     (not (equal (alist-get 'changeKey event) (plist-get entry :change))))
+                (push (list buffer (plist-get entry :begin) (plist-get entry :end)
+                            (concat (org-outlook-build-element event) "\n")) edits))))))))
+    (maphash
+     (lambda (id event)
+       (unless (or (gethash id locals) (alist-get '@removed event))
+         (let ((buffer (find-file-noselect (expand-file-name org-outlook-file))))
+           (push (list buffer (with-current-buffer buffer
+                                (save-restriction (widen) (point-max)))
+                       (with-current-buffer buffer
+                         (save-restriction (widen) (point-max)))
+                       (concat "\n" (org-outlook-build-element event) "\n"))
+                 edits))))
+     events)
+    (setq buffers (delete-dups (mapcar #'car edits)))
+    ;; An unchanged nested event must not disappear with its edited parent.
+    (maphash
+     (lambda (_id local)
+       (dolist (edit edits)
+         (when (and (eq (car local) (car edit))
+                    (< (nth 1 edit) (plist-get (cdr local) :begin))
+                    (< (plist-get (cdr local) :begin) (nth 2 edit)))
+           (error "Overlapping managed Outlook entries in %s" (buffer-name (car local))))))
+     locals)
+    ;; Catch overlapping parent/child edits before modifying any buffer.
+    (dolist (buffer buffers)
+      (with-current-buffer buffer
+        (when (or buffer-read-only (buffer-modified-p)
+                  (not (verify-visited-file-modtime buffer)))
+          (error "Save or reload local changes before syncing %s" (buffer-name))))
+      (let ((limit 0))
+        (dolist (edit (sort (cl-remove-if-not (lambda (edit) (eq buffer (car edit)))
+                                            (copy-sequence edits))
+                           (lambda (a b) (< (nth 1 a) (nth 1 b)))))
+          (when (< (nth 1 edit) limit)
+            (error "Overlapping managed Outlook entries in %s" (buffer-name buffer)))
+          (setq limit (nth 2 edit)))))
+    (unwind-protect
+        (progn
+          (dolist (buffer buffers)
+            (with-current-buffer buffer
+              (let ((group (prepare-change-group)))
+                (push (cons buffer group) groups)
+                (activate-change-group group))))
+          (dolist (buffer buffers)
+            (with-current-buffer buffer
+              (save-restriction
+                (widen)
+                (save-excursion
+                  (dolist (edit (sort (cl-remove-if-not (lambda (edit) (eq buffer (car edit)))
+                                                      (copy-sequence edits))
+                                     (lambda (a b) (> (nth 1 a) (nth 1 b)))))
+                    (goto-char (nth 1 edit))
+                    (delete-region (nth 1 edit) (nth 2 edit))
+                    (insert (nth 3 edit)))))))
+          (dolist (buffer buffers)
+            (with-current-buffer buffer (save-buffer))
+            (push buffer saved))
+          (org-id-update-id-locations (org-outlook--sync-files))
+          (org-id-locations-save)
+          (dolist (entry groups)
+            (with-current-buffer (car entry) (accept-change-group (cdr entry))))
+          (setq accepted t))
+      (unless accepted
+        (dolist (entry groups)
+          (with-current-buffer (car entry)
+            (cancel-change-group (cdr entry))
+            (set-buffer-modified-p nil)))
+        ;; Restore files already saved if a later save or index update failed.
+        (dolist (buffer saved)
+          (with-current-buffer buffer
+            (set-buffer-modified-p t)
+            (save-buffer)))))))
 
 (defun org-outlook-init-delta-link ()
-  "Initialize delta link after full sync for subsequent delta syncs."
-  (message "Initializing delta link...")
-  (let* ((data (org-outlook-retrieve-events-delta))
-         (deltalink (assoc-default '@odata.deltaLink data)))
-    (if deltalink
-        (progn
-          (org-outlook-set-token-field "delta" `(:delta ,deltalink) '())
-          (message "Delta link initialized successfully"))
-      (message "Warning: Could not initialize delta link"))))
+  "Initialize delta tracking through a reconciled full synchronization.
+Never establish a baseline without applying its events."
+  (interactive)
+  (org-outlook-full-sync))
 
 (defun org-outlook-full-sync ()
-  "Perform full calendar sync. Fetches all events in date range."
+  "Reconcile the current date window using a complete initial delta round."
   (interactive)
-  (message "Starting full sync...")
-  (let ((newevents (org-outlook-retrieve-pages)))
-    (message (concat "Full sync: processing " (number-to-string (length newevents)) " events"))
-    (when newevents (mapcar 'org-outlook-insert-or-update newevents))
-    (org-outlook-record-full-sync)
-    (message "Full sync complete")))
+  (when org-outlook--sync-running (user-error "Outlook sync is already running"))
+  (unless (hash-table-p org-id-locations) (org-id-locations-load))
+  (let* ((org-outlook--sync-running t)
+         (batch (org-outlook-retrieve-delta-pages nil t)))
+    (org-outlook--apply-sync-batch batch t)
+    (org-outlook--commit-sync batch t)
+    (message "Full Outlook sync complete")))
 
 (defun org-outlook-delta-sync-impl ()
-  "Internal function to perform delta sync. Use `org-outlook-sync' instead."
-  (let ((newevents (org-outlook-retrieve-delta-pages)))
-    (message (concat "Delta sync: processing " (number-to-string (length newevents)) " changes"))
-    (when newevents (mapcar 'org-outlook-insert-or-update newevents))
-    (message "Delta sync complete")))
+  "Apply a fetched delta round and commit its cursor only after local saves."
+  (when org-outlook--sync-running (user-error "Outlook sync is already running"))
+  (unless (hash-table-p org-id-locations) (org-id-locations-load))
+  (let* ((org-outlook--sync-running t)
+         (batch (org-outlook-retrieve-delta-pages)))
+    (org-outlook--apply-sync-batch batch nil)
+    (org-outlook--commit-sync batch nil)
+    (message "Delta Outlook sync complete")))
 
 (defun org-outlook-sync (&optional force-full)
-  "Sync Outlook calendar intelligently.
-Uses delta sync by default for efficiency and speed.
-Automatically performs full sync when:
-  - No delta link exists (first run)
-  - Delta link is stale (periodic validation)
-  - Delta sync fails (error recovery)
-
-With prefix argument FORCE-FULL, always performs full sync.
-
-Delta sync is fast and handles:
-  - New events
-  - Updated events
-  - Deleted events
-  - Cancelled events
-
-Full sync is slower but ensures no events are missed."
+  "Synchronize Outlook, using a full view when FORCE-FULL is non-nil.
+Rebuild the view when its date range changes or its cursor expires.
+Other fetch or local errors propagate without advancing the saved cursor."
   (interactive "P")
-  (message "Loading org-id cache...")
+  (when org-outlook--sync-running (user-error "Outlook sync is already running"))
   (org-id-locations-load)
-  (let ((delta-link (org-outlook-last-delta))
-        (last-full-sync (org-outlook-last-full-sync-time)))
-    (cond
-     ;; User explicitly requested full sync
-     (force-full
-      (message "Full sync requested by user")
-      (org-outlook-full-sync)
-      (org-outlook-init-delta-link))
-
-     ;; No delta link - need initial full sync
-     ((not delta-link)
-      (message "No delta link found - performing initial full sync")
-      (org-outlook-full-sync)
-      (org-outlook-init-delta-link))
-
-     ;; Time for periodic full sync validation
-     ((and org-outlook-full-sync-interval-days
-           last-full-sync
-           (time-less-p (time-add last-full-sync
-                                  (days-to-time org-outlook-full-sync-interval-days))
-                        (current-time)))
-      (message "Periodic full sync (last was %d days ago)"
-                       (/ (float-time (time-subtract (current-time) last-full-sync))
-                          86400))
-      (org-outlook-full-sync)
-      (org-outlook-init-delta-link))
-
-     ;; Normal delta sync with error recovery
-     (t
-      (message "Performing delta sync...")
+  (let* ((state (org-outlook--sync-state))
+         (last-full (org-outlook-last-full-sync-time))
+         (full (or force-full (not (plist-get state :delta))
+                   (not (equal (plist-get state :start) (org-outlook-start)))
+                   (not (equal (plist-get state :end) (org-outlook-end)))
+                   (and org-outlook-full-sync-interval-days last-full
+                        (time-less-p
+                         (time-add last-full (days-to-time org-outlook-full-sync-interval-days))
+                         (current-time))))))
+    (if full
+        (org-outlook-full-sync)
       (condition-case err
           (org-outlook-delta-sync-impl)
-        (error
-         (message "Delta sync failed: %s - falling back to full sync" err)
-         (org-outlook-full-sync)
-         (org-outlook-init-delta-link))))))
-
-    ;; Update org-id cache after any sync operation
-    (message "Updating org-id cache...")
-    (org-id-update-id-locations (list org-outlook-file))
-    (org-id-locations-save))
+        (org-outlook-graph-error
+         (let ((result (nth 2 err)))
+           (if (and (org-outlook-graph-result-p result)
+                    (eq (org-outlook-graph-result-error result) 'gone))
+               (org-outlook-full-sync)
+             (signal (car err) (cdr err)))))))))
 
 (defun org-outlook-create-teams-meeting (subject start-time end-time)
   "Create a standalone Teams meeting with SUBJECT, START-TIME and END-TIME.

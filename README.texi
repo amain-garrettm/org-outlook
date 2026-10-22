@@ -311,13 +311,13 @@ Add this form to your init file:
 @item
 @strong{First run}: Automatically performs full sync and initializes delta tracking
 @item
-@strong{Daily use}: Fast delta sync (only processes changes since last sync)
+@strong{Same date window}: Delta sync processes changes since the last committed sync
 @item
-@strong{Weekly}: Automatic full sync for validation (configurable with @samp{org-outlook-full-sync-interval-days})
+@strong{Window rollover}: A full sync includes dates entering the moving window. Periodic validation is configurable with @samp{org-outlook-full-sync-interval-days}.
 @item
-@strong{Error recovery}: Falls back to full sync if delta sync fails
+@strong{Error recovery}: An expired cursor (HTTP 410) starts a full sync; other errors stop the operation.
 @item
-@strong{Deleted events}: Automatically removed during delta sync
+@strong{Deleted events}: Delta removes known entries in range. Full sync also removes managed event subtrees missing from the server view. Out-of-window history and undated entries are retained.
 @end itemize
 
 @item

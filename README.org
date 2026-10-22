@@ -152,10 +152,26 @@ Installing with [[https://framagit.org/steckerhalter/quelpa][Quelpa]] is easy:
 
      *How sync works:*
      - *First run*: Automatically performs full sync and initializes delta tracking
-     - *Daily use*: Fast delta sync (only processes changes since last sync)
-     - *Weekly*: Automatic full sync for validation (configurable with =org-outlook-full-sync-interval-days=)
-     - *Error recovery*: Falls back to full sync if delta sync fails
-     - *Deleted events*: Automatically removed during delta sync
+     - *Same date window*: Delta sync processes changes since the last committed sync
+     - *Window rollover*: A new full sync includes dates entering the moving window
+     - *Periodic validation*: Full sync after =org-outlook-full-sync-interval-days=, even if the window is unchanged
+     - *Error recovery*: An expired cursor (HTTP 410) starts a full sync; other errors stop the operation
+     - *Deleted events*: Delta removes known entries in range; full sync also removes managed entries missing from the server view
+
+     Full sync uses an initial delta round so its events and cursor describe the
+     same view. All pages are fetched and edits are prepared before local changes
+     begin. Files and the Org ID index are saved before the cursor and completion
+     time are committed together. If a save fails, buffer changes are rolled back
+     and files already saved are restored when possible. A process crash or disk
+     failure can interrupt these separate file saves; the previous cursor remains
+     available for an idempotent retry.
+
+     Reconciliation checks =org-outlook-file= and registered Org ID files, including
+     refiled entries. Only headlines whose =ID= matches the hash of =OUTLOOK-ID= are
+     managed. Out-of-window history, undated entries, and unrelated headings are
+     retained. Pruning deletes the managed event subtree; preserving personal notes
+     inside imported event bodies remains a separate improvement. Save local edits
+     before syncing an affected buffer.
 
 +  *Accepting a meeting request:*
      - With point on the entry in the agenda view or within the org entry body: =org-outlook-accept-event=
@@ -250,12 +266,18 @@ Installing with [[https://framagit.org/steckerhalter/quelpa][Quelpa]] is easy:
   responses, and propagate HTTP failures instead of treating them as empty pages.
 + The transport returns =org-outlook-graph-result= structures. Package commands
   signal =org-outlook-graph-error= on failure; its condition data includes the result.
-+ Graph regression tests are in =test/org-outlook-graph-test.el=. With package
++ Full sync reconciles a complete initial delta round and commits its cursor only
+  after local application and saves. Existing cursors without window metadata are
+  replaced by a full sync on the next =org-outlook-sync=.
++ Delta retrieval now returns an =org-outlook-sync-batch= without saving its cursor.
+  Standalone =org-outlook-full-sync= also initializes delta tracking.
++ Regression tests cover Graph transport and sync transactions. With package
   dependencies installed, run:
 
   #+BEGIN_SRC sh
-  emacs --batch --eval "(package-initialize)" -L . \
-    -l test/org-outlook-graph-test.el -f ert-run-tests-batch-and-exit
+  emacs --batch --eval "(package-initialize)" -L . -L test \
+    -l org-outlook-graph-test -l org-outlook-sync-test \
+    -f ert-run-tests-batch-and-exit
   #+END_SRC
 
 ** 0.1.4-beta (2026-04-21)
