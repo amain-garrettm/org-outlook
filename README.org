@@ -80,11 +80,11 @@ Registration in Microsoft Entra (Formally Azure Active Directory) via
 - =Calendars.ReadWrite= - Create and modify calendar events
 - =offline_access= - Maintain access when user is offline
 
-*Additional permissions for Teams meeting functionality:*
-- =OnlineMeetings.ReadWrite= - Create Teams meetings with join links
-- =Calendars.ReadBasic.All= - Check availability of other users
-
-*Note:* For Teams functionality, you may need to use the =https://graph.microsoft.com/.default= scope instead of individual permissions due to Microsoft Graph API limitations.
+Teams-enabled calendar events use =Calendars.ReadWrite=. The package no longer
+creates standalone online meetings, so =OnlineMeetings.ReadWrite= is not required.
+Availability checks also work with =Calendars.ReadWrite=. Teams must be available
+for the account and calendar. Authentication currently requests the registered
+Graph permissions through =https://graph.microsoft.com/.default=.
 
 Under "Authentication" click =Add a platform= and add =http://localhost:9004= as
 the redirect uri. At the bottom of the page ensure =Allow public client flows= is toggled to
@@ -156,7 +156,7 @@ Installing with [[https://framagit.org/steckerhalter/quelpa][Quelpa]] is easy:
      - *Window rollover*: A new full sync includes dates entering the moving window
      - *Periodic validation*: Full sync after =org-outlook-full-sync-interval-days=, even if the window is unchanged
      - *Error recovery*: An expired cursor (HTTP 410) starts a full sync; other errors stop the operation
-     - *Deleted events*: Delta removes known entries in range; full sync also removes managed entries missing from the server view
+     - *Deleted events*: Delta and full sync retire missing events in range while retaining their personal note containers
 
      Full sync uses an initial delta round so its events and cursor describe the
      same view. All pages are fetched and edits are prepared before local changes
@@ -167,11 +167,11 @@ Installing with [[https://framagit.org/steckerhalter/quelpa][Quelpa]] is easy:
      available for an idempotent retry.
 
      Reconciliation checks =org-outlook-file= and registered Org ID files, including
-     refiled entries. Only headlines whose =ID= matches the hash of =OUTLOOK-ID= are
-     managed. Out-of-window history, undated entries, and unrelated headings are
-     retained. Pruning deletes the managed event subtree; preserving personal notes
-     inside imported event bodies remains a separate improvement. Save local edits
-     before syncing an affected buffer.
+     refiled entries. Only headlines whose =ID= matches the hash of =OUTLOOK-ID= or
+     =OUTLOOK-RETIRED-ID= are managed. Out-of-window history, undated entries, and
+     unrelated headings are retained. Retiring an event removes its generated
+     schedule and join link, marks =OUTLOOK-STATUS= as =DELETED=, and retains the
+     parent's ID, notes, and personal children. Save local edits before syncing.
 
 +  *Accepting a meeting request:*
      - With point on the entry in the agenda view or within the org entry body: =org-outlook-accept-event=
@@ -191,8 +191,8 @@ Installing with [[https://framagit.org/steckerhalter/quelpa][Quelpa]] is easy:
      - Upon finalization (=C-c C-c=), the system automatically:
        - Checks availability of all invitees
        - Warns if conflicts exist with options to continue, edit, or cancel
-       - Creates Teams meeting with join link if Teams meeting was selected
-       - Creates the event in Outlook if proceeding
+       - Creates one calendar event, enabling Teams only when selected
+       - Stores the returned event ID and Teams join URL in the captured entry
 
 +  *Checking availability:*
      - =M-x org-outlook-check-availability= - Interactive availability check for multiple people
@@ -221,6 +221,27 @@ Installing with [[https://framagit.org/steckerhalter/quelpa][Quelpa]] is easy:
 
 ** Tips
 
++ *Keeping personal notes:* Imported entries have a parent headline for your
+  TODO state, priority, tags, notes, clocks, and personal children. The child
+  marked with =OUTLOOK-MANAGED-ID= contains the current server description,
+  schedule, and join link; sync replaces that child. Put personal content outside
+  it. Refile the parent to retain this structure. Synced event times do not
+  generate Org clock entries.
+
+  =ID=, =OUTLOOK-*=, =CHANGEKEY=, =LOCATION=, =URL=, =TEAMSURL=, =ACCEPTED=,
+  =DECLINED=, and =NO-RESPONSE= are reserved sync properties. Other node properties
+  remain yours. Remote subject, categories, and response state are stored as
+  =OUTLOOK-SUBJECT=, =OUTLOOK-CATEGORIES=, and =OUTLOOK-STATUS=; sync preserves your
+  parent headline and tags. Cancelled meetings retain their notes and show an
+  inactive timestamp in the generated child.
+
++ *Existing entries:* The next sync migrates legacy entries, even when their
+  server change key has not changed. Their old body is retained in a =COMMENT
+  Preserved legacy text= child, because personal notes cannot be distinguished
+  reliably from the old imported description. Personal child headings and node
+  properties stay in place. Move any personal text or clocks you want active out
+  of that commented child. The preserved copy is never regenerated.
+
 + *Graph request failures:* Calendar, Teams, and availability calls use a shared
   synchronous transport. A 401 response refreshes credentials and retries once.
   Other errors stop the operation and report their HTTP status; throttling errors
@@ -236,16 +257,24 @@ Installing with [[https://framagit.org/steckerhalter/quelpa][Quelpa]] is easy:
   3. Fill in the template:
      - =INVITEES:= Space-separated email addresses (e.g., =john@company.com mary@company.com=)
      - =LOCATION:= Meeting location
-     - =MEETING-TIME:= Use org timestamp (e.g., =<2025-12-01 Mon 14:00-15:00>=)
+     - =MEETING-TIME:= Enter an Org timestamp with an explicit end time (e.g., =<2025-12-01 Mon 14:00-15:00>=)
   4. Press =C-c C-c= to finalize
   5. If conflicts are detected, choose from:
      - =(c)ontinue anyway= - Proceed despite conflicts
      - =(e)dit capture= - Return to edit invitees/time
      - =(q)uit capture= - Cancel the meeting creation
   6. If Teams meeting was selected:
-     - Automatically creates Teams meeting with join link
-     - Join link is included in the meeting body and org entry
-  7. Meeting is automatically created in Outlook and synced to your org file
+     - The calendar event itself creates the Teams meeting
+     - Outlook supplies the join link; the same link is stored in =TEAMSURL= and the generated child
+  7. The capture is saved directly in =org-outlook-file= with the returned event ID.
+     Subsequent syncs update that entry and retain its original capture notes.
+
+  Creation stores an =OUTLOOK-TRANSACTION-ID= for manual retries after uncertain
+  responses. Once Graph returns an event ID, retries update that event instead of
+  creating another one. Updates do not export personal Org notes or overwrite
+  Outlook's meeting body. =MEETING-TIME= overrides the stored server start/end
+  when explicitly updating an event. If Graph saves an event without returning a
+  Teams URL, the command reports that condition while retaining its ID.
 
 
 
@@ -271,12 +300,18 @@ Installing with [[https://framagit.org/steckerhalter/quelpa][Quelpa]] is easy:
   replaced by a full sync on the next =org-outlook-sync=.
 + Delta retrieval now returns an =org-outlook-sync-batch= without saving its cursor.
   Standalone =org-outlook-full-sync= also initializes delta tracking.
-+ Regression tests cover Graph transport and sync transactions. With package
++ Synced content now lives in a marked child. Personal headlines, properties,
+  notes, clocks, and children survive updates, retirement, and reactivation.
++ Capture uses one calendar creation request, honors the Teams choice, and stores
+  the returned join URL. Standalone Teams creation helpers have been removed.
+  Only the Outlook capture template triggers calendar writes during finalization.
++ Regression tests cover Graph transport, sync transactions, note preservation,
+  and calendar capture. With package
   dependencies installed, run:
 
   #+BEGIN_SRC sh
   emacs --batch --eval "(package-initialize)" -L . -L test \
-    -l org-outlook-graph-test -l org-outlook-sync-test \
+    -l org-outlook-graph-test -l org-outlook-sync-test -l org-outlook-content-test \
     -f ert-run-tests-batch-and-exit
   #+END_SRC
 

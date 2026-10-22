@@ -221,15 +221,11 @@ Registration in Microsoft Entra (Formally Azure Active Directory) via
 @samp{offline_access} - Maintain access when user is offline
 @end itemize
 
-@strong{Additional permissions for Teams meeting functionality:}
-@itemize
-@item
-@samp{OnlineMeetings.ReadWrite} - Create Teams meetings with join links
-@item
-@samp{Calendars.ReadBasic.All} - Check availability of other users
-@end itemize
-
-@strong{Note:} For Teams functionality, you may need to use the @samp{https://graph.microsoft.com/.default} scope instead of individual permissions due to Microsoft Graph API limitations.
+Teams-enabled calendar events and availability checks use @samp{Calendars.ReadWrite}.
+Standalone online meetings are no longer created, so @samp{OnlineMeetings.ReadWrite}
+is not required. Teams must be available for the account and calendar.
+Authentication currently requests registered Graph permissions through
+@samp{https://graph.microsoft.com/.default}.
 
 Under "Authentication" click @samp{Add a platform} and add @samp{http://localhost:9004} as
 the redirect uri. At the bottom of the page ensure @samp{Allow public client flows} is toggled to
@@ -317,7 +313,7 @@ Add this form to your init file:
 @item
 @strong{Error recovery}: An expired cursor (HTTP 410) starts a full sync; other errors stop the operation.
 @item
-@strong{Deleted events}: Delta removes known entries in range. Full sync also removes managed event subtrees missing from the server view. Out-of-window history and undated entries are retained.
+@strong{Deleted events}: Delta and full sync retire missing events in range while retaining their personal note containers. Out-of-window history and undated entries are retained.
 @end itemize
 
 @item
@@ -407,6 +403,24 @@ Creates the event in Outlook if proceeding
 @node Tips
 @section Tips
 
+Imported parent headlines hold your TODO state, tags, notes, clocks, and
+personal children. Sync replaces only reserved Outlook properties and the
+child marked with @samp{OUTLOOK-MANAGED-ID}. Put personal content outside that
+child. Remote subject, categories, and state are recorded in
+@samp{OUTLOOK-SUBJECT}, @samp{OUTLOOK-CATEGORIES}, and @samp{OUTLOOK-STATUS}.
+New imports do not generate synthetic Org clock entries.
+
+On migration, an old entry's body is preserved in a commented
+@samp{Preserved legacy text} child. Move personal text or clocks you want
+active out of that child. Existing personal child headings remain in place.
+Retirement removes the generated schedule and join URL, retains notes and
+the Org ID, and records @samp{OUTLOOK-RETIRED-ID} and @samp{OUTLOOK-DELETED}.
+
+Only the Outlook capture template writes calendar events during finalization.
+Creation reuses an @samp{OUTLOOK-TRANSACTION-ID} on manual retries. Once Graph
+returns an event ID, retries update that event. Updates do not upload personal
+notes or replace the server's online-meeting body.
+
 @itemize
 @item
 Calling @samp{org-outlook-sync} via @samp{emacs --batch} avoids blocking your main emacs session.
@@ -444,12 +458,13 @@ If conflicts are detected, choose from:
 If Teams meeting was selected:
 @itemize
 @item
-Automatically creates Teams meeting with join link
+The calendar event itself creates the Teams meeting when selected.
 @item
-Join link is included in the meeting body and org entry
+Outlook's returned join link is stored in @samp{TEAMSURL} and the generated child.
 @end itemize
 @item
-Meeting is automatically created in Outlook and synced to your org file
+The capture is saved in @samp{org-outlook-file} with the returned event ID.
+Subsequent syncs update it while preserving personal notes.
 @end enumerate
 @end itemize
 

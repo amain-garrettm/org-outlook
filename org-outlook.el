@@ -44,7 +44,6 @@
 (defconst org-outlook-events-url "https://graph.microsoft.com/v1.0/me/calendarview")
 (defconst org-outlook-events-create-url "https://graph.microsoft.com/v1.0/me/calendar/events")
 (defconst org-outlook-schedule-url "https://graph.microsoft.com/v1.0/me/calendar/getSchedule")
-(defconst org-outlook-teams-meeting-url "https://graph.microsoft.com/v1.0/me/onlineMeetings")
 
 (define-error 'org-outlook-graph-error "Microsoft Graph request failed")
 
@@ -403,47 +402,88 @@ Returns the authorization code on success."
 			  (org-ml-headline-set-node-property "ID" id hl))))))
 
 (defun org-outlook-get-appointment-property (prop)
-  ;; (message "org-outlook-get-appointment-property called in buffer: %s, mode: %s"
-  ;;          (buffer-name) major-mode)
+  "Get PROP from this Org entry or its event parent."
   (unless (derived-mode-p 'org-mode)
     (user-error "This command must be run from an org-mode buffer"))
-  (let ((elm (org-ml-parse-element-at (point))))
-    (setq mytest elm)
-    (->>
-     elm
-     (org-ml-headline-get-node-property prop))))
+  (save-excursion
+    (org-back-to-heading t)
+    (let ((value (org-entry-get nil prop)))
+      (while (and (not value)
+                  (not (org-entry-get nil "OUTLOOK-ID"))
+                  (not (org-entry-get nil "OUTLOOK-RETIRED-ID"))
+                  (org-up-heading-safe))
+        (setq value (org-entry-get nil prop)))
+      value)))
 
 
 (defun org-outlook-calendar-create-or-update-event ()
+  "Create or update the current calendar event and record its returned ID.
+Only new events export their capture body.  Updates never upload personal
+notes or overwrite Graph's online-meeting body.  New events use a stable
+transaction ID so a manual retry after an uncertain response is deduplicated."
   (interactive)
-  (let* ((elm (org-ml-parse-element-at (point)))
-	 (title (car (append (->> elm (org-ml-get-property :title)) nil))) ; TODO Fix
-	 (body (org-msg-export-as-html (mapconcat #'concat (->> elm (org-ml-headline-get-contents (list :log-into-drawer org-log-into-drawer :clock-into-drawer org-clock-into-drawer :clock-out-notes org-log-note-clock-out) ) (-map #'org-ml-to-string) ) "") ))
-	 (meeting-time (->> elm (org-ml-headline-get-node-property "MEETING-TIME"))) ; TODO FIX
-	 (start (org-outlook-start-time-from-timestamp meeting-time))
-	 (end (org-outlook-end-time-from-timestamp meeting-time))
-					;(categories ["CAT1" "CAT2"])
-	 (categories (vector))
-	 (id (->> elm (org-ml-headline-get-node-property "OUTLOOK-ID")))
-	 (method (if id "PATCH" "POST"))
-	 (location (->> elm (org-ml-headline-get-node-property "LOCATION")))
-	 (attendees (->> elm (org-ml-headline-get-node-property "INVITEES")))
-	 (teamsmeeting t))
-
-    (prog1
-        (org-outlook--graph-data
-         (intern (downcase method))
-         (if id (concat org-outlook-events-create-url "/" id) org-outlook-events-create-url)
-         :body `(("subject" . ,title)
-                 ("body" . (("contentType" . "HTML") ("content" . ,body)))
-                 ("start" . (("dateTime" . ,start) ("timeZone" . ,org-outlook-local-timezone)))
-                 ("end" . (("dateTime" . ,end) ("timeZone" . ,org-outlook-local-timezone)))
-                 ("location" . (("displayName" . ,location)))
-                 ("attendees" . ,(org-outlook-create-attendees-list attendees))
-                 ("categories" . ,categories)
-                 ("isOnlineMeeting" . ,teamsmeeting)
-                 ("onlineMeetingProvider" . "teamsForBusiness")))
-      (message "%s event" (if id "Updated" "Created")))))
+  (org-back-to-heading t)
+  (let* ((title (org-get-heading t t t t))
+         (meeting-time (org-entry-get nil "MEETING-TIME"))
+         (start (if meeting-time (org-outlook-start-time-from-timestamp meeting-time)
+                  (org-entry-get nil "OUTLOOK-START")))
+         (end (if meeting-time (org-outlook-end-time-from-timestamp meeting-time)
+                (org-entry-get nil "OUTLOOK-END")))
+         (id (org-entry-get nil "OUTLOOK-ID"))
+         (teams (equal "yes" (org-entry-get nil "TEAMS-MEETING")))
+         (invitees (org-entry-get nil "INVITEES"))
+         (location (org-entry-get nil "LOCATION"))
+         (transaction (unless id (or (org-entry-get nil "OUTLOOK-TRANSACTION-ID")
+                                    (org-id-uuid))))
+         (body (unless id
+                 (org-msg-export-as-html
+                  (buffer-substring-no-properties
+                   (save-excursion (org-end-of-meta-data) (point))
+                   (save-excursion (org-end-of-subtree t t) (point))))))
+         (payload
+          (append
+           `(("subject" . ,title)
+             ("start" . (("dateTime" . ,start) ("timeZone" . ,org-outlook-local-timezone)))
+             ("end" . (("dateTime" . ,end) ("timeZone" . ,org-outlook-local-timezone))))
+           (when location `(("location" . (("displayName" . ,location)))))
+           (when invitees `(("attendees" . ,(org-outlook-create-attendees-list invitees))))
+           (unless id `(("body" . (("contentType" . "HTML") ("content" . ,body)))
+                         ("transactionId" . ,transaction)
+                         ("isOnlineMeeting" . ,(if teams t :json-false))))
+           (when (and id teams) '(("isOnlineMeeting" . t)))
+           (when teams '(("onlineMeetingProvider" . "teamsForBusiness"))))))
+    (when (org-entry-get nil "OUTLOOK-RETIRED-ID")
+      (user-error "This event was retired; use a new capture to create a meeting"))
+    (unless (and (stringp start) (stringp end) (string< start end))
+      (user-error "Meeting time must include an end later than its start"))
+    (unless id (org-entry-put nil "OUTLOOK-TRANSACTION-ID" transaction))
+    (let* ((data (org-outlook--graph-data
+                  (if id 'patch 'post)
+                  (if id (concat org-outlook-events-create-url "/" (url-hexify-string id))
+                    org-outlook-events-create-url)
+                  :body payload
+                  :headers `(("Prefer" . ,(format "outlook.timezone=\"%s\"" org-outlook-local-timezone)))))
+           (remote-id (alist-get 'id data))
+           (join (alist-get 'joinUrl (alist-get 'onlineMeeting data))))
+      (unless (and (stringp remote-id) (not (string-empty-p remote-id)))
+        (signal 'org-outlook-graph-error '("Calendar response has no event ID")))
+      ;; Retain identity before any further processing can fail.
+      (org-entry-put nil "OUTLOOK-ID" remote-id)
+      (org-entry-put nil "ID" (secure-hash 'sha256 remote-id))
+      (org-entry-put nil "OUTLOOK-SYNC-VERSION" "1")
+      (when join (org-entry-put nil "TEAMSURL" join))
+      (let* ((entry (list :id remote-id :begin (point)))
+             (edits (org-outlook--entry-edits (current-buffer) entry data)))
+        (atomic-change-group
+          (save-excursion
+            (dolist (edit (sort edits (lambda (a b) (> (nth 1 a) (nth 1 b)))))
+              (goto-char (nth 1 edit))
+              (delete-region (nth 1 edit) (nth 2 edit))
+              (insert (nth 3 edit))))))
+      (when (and teams (not join))
+        (user-error "Event saved, but Graph returned no Teams join URL; retry updates this event"))
+      (message "%s Outlook event" (if id "Updated" "Created"))
+      data)))
 
 (if (listp org-agenda-files)
     (add-to-list 'org-agenda-files org-outlook-file)
@@ -468,59 +508,111 @@ so we parse them as-is without forcing UTC conversion."
     (let ((org-inhibit-startup t)) (org-mode))
     (html2org (current-buffer) (point-min) (point-max) nil)))
 (defun attendee-list (attendees &optional responsefilter)
-  (let* ((attendees (append attendees nil))
-	 (selected (-filter (lambda (item)(string= responsefilter (assoc-default 'response (assoc-default 'status item)))) attendees)))
-    (mapconcat (lambda (item) (concat "\"" (assoc-default 'name (assoc-default 'emailAddress item)) "\"<" (assoc-default 'address (assoc-default 'emailAddress item)) ">" )) selected " ")))
+  "Format ATTENDEES whose response matches RESPONSEFILTER."
+  (mapconcat
+   (lambda (item)
+     (let ((email (alist-get 'emailAddress item)))
+       (format "\"%s\"<%s>" (or (alist-get 'name email) "")
+               (or (alist-get 'address email) ""))))
+   (seq-filter (lambda (item)
+                 (equal responsefilter (alist-get 'response (alist-get 'status item))))
+               (append attendees nil))
+   " "))
+
+(defun org-outlook--one-line (value)
+  "Make VALUE safe for a headline or node property."
+  (replace-regexp-in-string "[\r\n]+" " " (or value "")))
+
+(defun org-outlook--event-status (event)
+  "Return Outlook's status for EVENT, independent of personal TODO states."
+  (cond ((eq t (alist-get 'isCancelled event)) "CANCELLED")
+        ((equal "notResponded" (alist-get 'response (alist-get 'responseStatus event))) "REQUEST")
+        (t "MEETING")))
+
+(defun org-outlook--event-properties (event)
+  "Return the reserved parent properties managed from EVENT."
+  (let ((id (alist-get 'id event)))
+    `(("ID" . ,(secure-hash 'sha256 id))
+      ("OUTLOOK-ID" . ,id) ("CHANGEKEY" . ,(alist-get 'changeKey event))
+      ("OUTLOOK-SUBJECT" . ,(alist-get 'subject event))
+      ("OUTLOOK-STATUS" . ,(org-outlook--event-status event))
+      ("OUTLOOK-CATEGORIES" . ,(json-encode (or (alist-get 'categories event) [])))
+      ("OUTLOOK-START" . ,(alist-get 'dateTime (alist-get 'start event)))
+      ("OUTLOOK-END" . ,(alist-get 'dateTime (alist-get 'end event)))
+      ("LOCATION" . ,(alist-get 'displayName (alist-get 'location event)))
+      ("URL" . ,(alist-get 'webLink event))
+      ("TEAMSURL" . ,(alist-get 'joinUrl (alist-get 'onlineMeeting event)))
+      ("ACCEPTED" . ,(attendee-list (alist-get 'attendees event) "accepted"))
+      ("DECLINED" . ,(attendee-list (alist-get 'attendees event) "declined"))
+      ("NO-RESPONSE" . ,(attendee-list (alist-get 'attendees event) "none")))))
+
+(defun org-outlook--put-properties (properties)
+  "Apply reserved PROPERTIES at the current headline."
+  (dolist (property properties)
+    (if (cdr property)
+        (org-entry-put nil (car property) (org-outlook--one-line (cdr property)))
+      (org-entry-delete nil (car property)))))
+
+(defun org-outlook--event-timestamp (event)
+  "Format EVENT as an active Org timestamp without synthetic clock entries."
+  (let* ((start (org-outlook-timestamp-to-list (alist-get 'dateTime (alist-get 'start event))))
+         (end (org-outlook-timestamp-to-list (alist-get 'dateTime (alist-get 'end event))))
+         (date (lambda (parts) (apply #'format "%04d-%02d-%02d" (cl-subseq parts 0 3))))
+         (time (lambda (parts) (format "%02d:%02d" (nth 3 parts) (nth 4 parts)))))
+    (if (equal (cl-subseq start 0 3) (cl-subseq end 0 3))
+        (format "<%s %s-%s>" (funcall date start) (funcall time start) (funcall time end))
+      (format "<%s %s>--<%s %s>" (funcall date start) (funcall time start)
+              (funcall date end) (funcall time end)))))
+
+(defun org-outlook--nest-body (body minimum-level)
+  "Keep all BODY headings beneath MINIMUM-LEVEL in a managed subtree."
+  (with-temp-buffer
+    (insert body)
+    (goto-char (point-min))
+    (while (re-search-forward "^\\(\\*+\\) " nil t)
+      (replace-match (make-string (+ minimum-level (1- (length (match-string 1)))) ?*)
+                     t t nil 1))
+    (buffer-string)))
+
+(defun org-outlook--event-section (event level)
+  "Render the replaceable child section for EVENT at LEVEL."
+  (let* ((body (alist-get 'body event))
+         (content (or (alist-get 'content body) ""))
+         (text (if (equal (downcase (or (alist-get 'contentType body) "html")) "text")
+                   content (org-outlook-convert-html-body content)))
+         (join (alist-get 'joinUrl (alist-get 'onlineMeeting event)))
+         (cancelled (equal "CANCELLED" (org-outlook--event-status event)))
+         (timestamp (org-outlook--event-timestamp event)))
+    (concat (make-string level ?*) " Outlook: "
+            (when cancelled "[CANCELLED] ")
+            (org-outlook--one-line (alist-get 'subject event)) "\n"
+            ":PROPERTIES:\n:OUTLOOK-MANAGED-ID: " (alist-get 'id event) "\n:END:\n"
+            (if cancelled (subst-char-in-string ?> ?\]
+                            (subst-char-in-string ?< ?\[ timestamp))
+              timestamp) "\n\n"
+            (when (and join (string-prefix-p "https://" join))
+              (concat "[[" join "][Join Teams meeting]]\n\n"))
+            (org-outlook--nest-body text (1+ level)) "\n")))
 
 (defun org-outlook-build-element (event)
-  (let* ((title (assoc-default 'subject event))
-	 (start (org-outlook-timestamp-to-list (assoc-default 'dateTime (assoc-default 'start event))))
-	 (end (org-outlook-timestamp-to-list (assoc-default 'dateTime (assoc-default 'end event))))
-	 (outlook-id (assoc-default 'id event)) ; was 'id
-	 (id (secure-hash 'sha256 outlook-id))
-	 (todo-state (if (not (eq :json-false (assoc-default 'isCancelled event))) "CANCELLED"
-                       (if (string=  (assoc-default 'response (assoc-default 'responseStatus event)) "notResponded")
-			   "REQUEST"
-			 "MEETING")))
-	 (locationlist (assoc-default 'displayName (assoc-default 'location event)))
-	 (location (if locationlist (s-replace-regexp "\\\n" ","  locationlist) "none"))
-	 (url (or (assoc-default 'webLink event) "none"))
-	 (teams (or (assoc-default 'joinUrl (assoc-default 'onlineMeeting event)) "none"))
-	 (accepted (attendee-list (assoc-default 'attendees event) "accepted"))
-	 (declined (attendee-list (assoc-default 'attendees event) "decline"))
-  	 (changekey (or (assoc-default 'changeKey event) "none"))
-	 (no-response (attendee-list (assoc-default 'attendees event) "none"))
-	 (categories (append (assoc-default 'categories event) nil))
-	 (timestamp (->> (org-ml-build-timestamp! start :active t :end end) (org-ml-to-trimmed-string)) )
-	 (html-body (or (assoc-default 'content (assoc-default 'body event)) "None"))
-         (body (org-outlook-convert-html-body html-body)))
-    (if title (->>
-	       (org-ml-build-headline! :level 2 :title-text title :tags categories :todo-keyword todo-state :section-children
-				       (list
-					(org-ml-build-property-drawer!
-       					 `("ID" ,id)
-					 `("OUTLOOK-ID" ,outlook-id)
-					 `("LOCATION" ,location)
-					 `("URL" ,url)
-					 `("ACCEPTED" ,accepted)
-					 `("DECLINED" ,declined)
-					 `("NO-RESPONSE" ,no-response)
-					 `("TEAMSURL" ,teams)
-		           		 `("CHANGEKEY" ,changekey)
-					 ;`("MEETING-TIME" ,timestamp)
-					 )
-                                        (org-ml-build-paragraph! timestamp)
-					(org-ml-build-clock! start :end end)
-					(org-ml-build-paragraph body)))
-	       (org-ml-to-trimmed-string))
-      "\n")
-    ))
+  "Build a new imported headline with a dedicated managed child."
+  (with-temp-buffer
+    (org-mode)
+    (insert "** " (org-outlook--event-status event) " "
+            (org-outlook--one-line (alist-get 'subject event)) "\n")
+    (goto-char (point-min))
+    (org-outlook--put-properties (org-outlook--event-properties event))
+    (org-entry-put nil "OUTLOOK-SYNC-VERSION" "1")
+    (goto-char (point-max))
+    (insert (org-outlook--event-section event 3))
+    (buffer-string)))
 
 (defun org-outlook-create-attendees-list (attendees-string)
-  (->> attendees-string
-       split-string
-       (mapcar (lambda (x) `("emailAddress" . (("address" . ,x)))))
-       (vector)))
+  "Return a flat JSON attendee array from ATTENDEES-STRING."
+  (vconcat
+   (mapcar (lambda (address)
+             `(("emailAddress" . (("address" . ,address))) ("type" . "required")))
+           (split-string (or attendees-string "") "[ \t\r\n]+" t))))
 
 (defun event-title (event)
   (assoc-default 'subject event))
@@ -543,24 +635,14 @@ Returns non-nil if Teams desktop app is detected."
         (eq 0 (call-process "flatpak" nil nil nil "info" "com.microsoft.Teams")))))
 
 (defun org-outlook-join-teams-call ()
-  "Join Teams meeting from current headline.
-Uses msteams:// protocol if Teams desktop app is installed,
-otherwise falls back to HTTPS URL for browser-based Teams."
+  "Join the returned Teams meeting URL from this entry or its event parent."
   (interactive)
-  (let* ((teams-url (->> (org-ml-parse-headline-at (point))
-                         (org-ml-headline-get-node-property "TEAMSURL")))
-         (use-teams-protocol (org-outlook-teams-installed-p))
-         (final-url (if use-teams-protocol
-                        (replace-regexp-in-string "https:" "msteams:" teams-url)
-                      teams-url)))
-    (if teams-url
-        (progn
-          (message (if use-teams-protocol
-                       "Opening Teams meeting in desktop app..."
-                     "Opening Teams meeting in browser (Teams app not detected)..."))
-          (browse-url-xdg-open final-url))
-      (message "No Teams URL found for this event"))))
-(setq org-outlook-staging-file "~/.cache/outlook-staging.org")
+  (let ((url (org-outlook-get-appointment-property "TEAMSURL")))
+    (unless (and (stringp url) (string-prefix-p "https://" url))
+      (user-error "No Teams join URL for this event"))
+    (browse-url (if (org-outlook-teams-installed-p)
+                    (concat "msteams:" (substring url (length "https:")))
+                  url))))
 (with-eval-after-load 'org-capture
   (defun org-outlook-capture-template ()
     "Returns `org-capture' template string for new outlook calendar event.
@@ -569,14 +651,14 @@ otherwise falls back to HTTPS URL for browser-based Teams."
            (teams-meeting (y-or-n-p "Include Teams meeting? ")))
       (mapconcat #'identity
                  `(
-                   ,(concat "** MEETING " title)
+                   ,(concat "* " (org-outlook--one-line title))
                    ":PROPERTIES:"
 		   ":INVITEES: %^{Space separated invitees: }"
 		   ,(if teams-meeting
 		        ":LOCATION: Microsoft Teams Meeting"
 		      ":LOCATION: %^{Meeting location: }")
-		   ":MEETING-TIME: %^{Specify meeting time: }T" ; TODO Fix
-		   ,(if teams-meeting ":TEAMS-MEETING: yes" "")
+                   ":MEETING-TIME: %^{Meeting time (e.g. <2026-10-22 Thu 09:00-10:00>): }"
+                   ,(if teams-meeting ":TEAMS-MEETING: yes" ":TEAMS-MEETING: no")
                    ":END:"
                    "%?\n")          ;Place the cursor here finally
                  "\n")))
@@ -585,33 +667,28 @@ otherwise falls back to HTTPS URL for browser-based Teams."
                '("o"                ;`org-capture' binding + o
                  "Outlook calendar event"
                  entry
-                 (file org-outlook-staging-file)
+                 (file org-outlook-file)
                  (function org-outlook-capture-template)
+                 :org-outlook t
 		 :kill-buffer t
 					;		  :prepare-finalize #'org-outlook-finalize-capture
 		 )))
 
 (defun org-outlook-finalize-capture ()
-  (save-excursion
-    (goto-char (point-min))
-    (if (re-search-forward "MEETING-TIME" nil t) ; TODO Fix
-	(progn
-	  (goto-char (point-min))
-	  ;; Check availability before creating the event
-	  (when (org-outlook-check-capture-availability)
-	    (org-outlook-handle-teams-meeting-creation)
-	    (org-outlook-calendar-create-or-update-event))
-					; (let ((attachments (org-outlook-get-appointment-property "ATTACHMENTS")))
-					;      (if attachments (mapc attachments #'org-outlook-add-attachment)))
-	  )
-      (message "not an outlook event"))))
+  "Finalize only captures made with the Outlook template."
+  (when (and (bound-and-true-p org-capture-mode)
+             (org-capture-get :org-outlook))
+    (save-excursion
+      (goto-char (point-min))
+      (org-back-to-heading t)
+      (when (org-outlook-check-capture-availability)
+        (org-outlook-calendar-create-or-update-event)))))
 
 (defun org-outlook-check-capture-availability ()
   "Check availability of invitees in current capture and prompt user if conflicts exist.
 Returns t to proceed with event creation, nil if user wants to edit."
-  (let* ((elm (org-ml-parse-element-at (point)))
-         (invitees-str (org-ml-headline-get-node-property "INVITEES" elm))
-         (meeting-time-str (org-ml-headline-get-node-property "MEETING-TIME" elm)))
+  (let* ((invitees-str (org-entry-get nil "INVITEES"))
+         (meeting-time-str (org-entry-get nil "MEETING-TIME")))
     (if (and invitees-str meeting-time-str
              (not (string-empty-p invitees-str))
              (not (string-empty-p meeting-time-str)))
@@ -648,32 +725,6 @@ Returns t to proceed with event creation, nil if user wants to edit."
       ;; No invitees or meeting time specified - proceed
       t)))
 
-(defun org-outlook-handle-teams-meeting-creation ()
-  "Handle Teams meeting creation during capture if TEAMS-MEETING property is set."
-  (let* ((elm (org-ml-parse-element-at (point)))
-         (teams-meeting (org-ml-headline-get-node-property "TEAMS-MEETING" elm))
-         (title (car (append (org-ml-get-property :title elm) nil)))
-         (meeting-time-str (org-ml-headline-get-node-property "MEETING-TIME" elm)))
-    (when (and teams-meeting (string= teams-meeting "yes") meeting-time-str title)
-      (let* ((start-time-iso (concat (org-outlook-start-time-from-timestamp meeting-time-str) ".0000000"))
-             (end-time-iso (concat (org-outlook-end-time-from-timestamp meeting-time-str) ".0000000"))
-             ;; Convert to ISO 8601 format with timezone
-             (current-time-obj (current-time))
-             (timezone-offset (format-time-string "%z" current-time-obj))
-             ;; Convert +0100 format to +01:00 format
-             (formatted-tz (if (string-match "\\([+-][0-9][0-9]\\)\\([0-9][0-9]\\)" timezone-offset)
-                               (concat (match-string 1 timezone-offset) ":" (match-string 2 timezone-offset))
-                             "+00:00"))
-             (start-time-with-tz (concat start-time-iso formatted-tz))
-             (end-time-with-tz (concat end-time-iso formatted-tz))
-             (teams-data (org-outlook-create-teams-meeting title start-time-with-tz end-time-with-tz)))
-        (when teams-data
-          (let ((teams-body (org-outlook-format-teams-meeting-body teams-data)))
-            ;; Add the Teams meeting info to the capture buffer
-            (save-excursion
-              (goto-char (point-max))
-              (unless (bolp) (insert "\n"))
-              (insert teams-body))))))))
 
 (defun org-outlook-get-busy-attendees (schedules start-time end-time)
   "Return list of email addresses that are busy during the specified time slot."
@@ -789,21 +840,26 @@ Perform local decline cleanup only after the server accepts the response."
 (setq org-outlook-events-delta-url "https://graph.microsoft.com/v1.0/me/calendarview/delta")
 
 (defun org-outlook-delete-by-id (id)
-  (let* ((location (org-id-find id))
-	 (file (car location))
-	 (pos (cdr location))
-	 )
-    (with-current-buffer (or (get-file-buffer file)(find-file-noselect file))
-      (unless (derived-mode-p 'org-mode)
-        (let ((org-inhibit-startup t)) (org-mode)))
-      (goto-char pos)
-      (let*
-	  ((element (org-element-at-point))
-	   (begin (org-element-property :begin element))
-	   (end (org-element-property :end element)))
-	(delete-region begin end)
-	(save-buffer)
-	))))
+  "Retire the managed event ID while retaining its personal Org content.
+Unknown or already retired IDs are harmless."
+  (let ((location (org-id-find id)))
+    (when location
+      (with-current-buffer (find-file-noselect (car location))
+        (save-restriction
+          (widen)
+          (save-excursion
+            (goto-char (cdr location))
+            (let ((remote (org-entry-get nil "OUTLOOK-ID")))
+              (when (and remote (equal id (org-entry-get nil "ID"))
+                         (equal id (secure-hash 'sha256 remote)))
+                (let ((edits (org-outlook--entry-edits
+                              (current-buffer) (list :id remote :begin (point)) nil)))
+                  (atomic-change-group
+                    (dolist (edit (sort edits (lambda (a b) (> (nth 1 a) (nth 1 b)))))
+                      (goto-char (nth 1 edit))
+                      (delete-region (nth 1 edit) (nth 2 edit))
+                      (insert (nth 3 edit)))
+                    (save-buffer)))))))))))
 
 (defun org-outlook--build-query-string (params)
   "URL-encode PARAMS alist into a query string.
@@ -964,6 +1020,73 @@ section is inspected, so timestamps in child headings do not qualify it."
                (not (time-less-p to (parse-iso8601-time-string (concat start "T00:00:00Z"))))
                (not (time-less-p (parse-iso8601-time-string (concat end "T23:59:59Z")) from))))))))
 
+(defun org-outlook--managed-child (id)
+  "Return the bounds of the direct generated child for remote ID.
+Personal children are never selected by their title alone."
+  (save-excursion
+    (let ((level (org-outline-level))
+          (end (save-excursion (org-end-of-subtree t t) (point)))
+          found)
+      (outline-next-heading)
+      (while (< (point) end)
+        (when (and (= (org-outline-level) (1+ level))
+                   (equal id (org-entry-get nil "OUTLOOK-MANAGED-ID")))
+          (when found (error "Duplicate generated Outlook sections"))
+          (setq found (cons (point) (save-excursion (org-end-of-subtree t t) (point)))))
+        (outline-next-heading))
+      found)))
+
+(defun org-outlook--entry-edits (buffer entry event)
+  "Plan safe edits to ENTRY in BUFFER from EVENT, or retire it when nil.
+Only the parent's reserved properties and marked generated child change.
+Legacy body text is retained in a commented child on first migration."
+  (with-current-buffer buffer
+    (save-restriction
+      (widen)
+      (save-excursion
+        (goto-char (plist-get entry :begin))
+        (let* ((begin (point))
+               (id (plist-get entry :id))
+               (level (org-outline-level))
+               (section-end (save-excursion (outline-next-heading) (point)))
+               (child (org-outlook--managed-child id))
+               (prefix (buffer-substring-no-properties begin section-end))
+               (generated (and event (org-outlook--event-section event (1+ level))))
+               (parent
+                (with-temp-buffer
+                  (org-mode)
+                  (insert prefix)
+                  (goto-char (point-min))
+                  (unless (org-entry-get nil "OUTLOOK-SYNC-VERSION")
+                    (org-end-of-meta-data)
+                    (let ((legacy (buffer-substring-no-properties (point) (point-max))))
+                      (delete-region (point) (point-max))
+                      (unless (string-empty-p (string-trim legacy))
+                        (goto-char (point-max))
+                        (insert "\n" (make-string (1+ level) ?*)
+                                " COMMENT Preserved legacy text\n"
+                                "Retained during migration; move personal notes outside this child.\n\n"
+                                legacy)
+                        (unless (bolp) (insert "\n")))))
+                  (goto-char (point-min))
+                  (org-entry-put nil "OUTLOOK-SYNC-VERSION" "1")
+                  (if event
+                      (progn
+                        (org-outlook--put-properties (org-outlook--event-properties event))
+                        (org-entry-delete nil "OUTLOOK-RETIRED-ID")
+                        (org-entry-delete nil "OUTLOOK-DELETED"))
+                    (org-entry-put nil "OUTLOOK-RETIRED-ID" id)
+                    (org-entry-put nil "OUTLOOK-DELETED" "t")
+                    (org-entry-put nil "OUTLOOK-STATUS" "DELETED")
+                    (org-entry-delete nil "OUTLOOK-ID")
+                    (org-entry-delete nil "TEAMSURL"))
+                  (goto-char (point-max))
+                  (unless (bolp) (insert "\n"))
+                  (when (and generated (not child)) (insert generated))
+                  (buffer-string))))
+          (append (list (list buffer begin section-end parent))
+                  (when child (list (list buffer (car child) (cdr child) (or generated ""))))))))))
+
 (defun org-outlook--managed-entries (buffer start end)
   "Index verifiably imported headlines in BUFFER for dates START and END."
   (with-current-buffer buffer
@@ -974,13 +1097,20 @@ section is inspected, so timestamps in child headings do not qualify it."
         (let (entries)
           (org-map-entries
            (lambda ()
-             (let ((remote (org-entry-get nil "OUTLOOK-ID"))
+             (let ((remote (or (org-entry-get nil "OUTLOOK-ID")
+                               (org-entry-get nil "OUTLOOK-RETIRED-ID")))
                    (id (org-entry-get nil "ID")))
                (when (and remote id (equal id (secure-hash 'sha256 remote)))
                  (push (list :id remote :begin (point)
                              :end (save-excursion (org-end-of-subtree t t) (point))
                              :change (org-entry-get nil "CHANGEKEY")
-                             :in-window (org-outlook--entry-in-window-p start end))
+                             :version (org-entry-get nil "OUTLOOK-SYNC-VERSION")
+                             :child (org-outlook--managed-child remote)
+                             :deleted (org-entry-get nil "OUTLOOK-DELETED")
+                             :in-window (save-excursion
+                                          (let ((child (org-outlook--managed-child remote)))
+                                            (when child (goto-char (car child)))
+                                            (org-outlook--entry-in-window-p start end))))
                        entries))))
            nil nil)
           entries)))))
@@ -1011,7 +1141,8 @@ be retried safely from the previous cursor."
           (dolist (entry (org-outlook--managed-entries buffer start end))
             (let* ((id (plist-get entry :id))
                    (event (gethash id events))
-                   (remove (and (plist-get entry :in-window)
+                   (remove (and (not (plist-get entry :deleted))
+                                (plist-get entry :in-window)
                                 (or (alist-get '@removed event)
                                     (and full (not event))))))
               (when (gethash id locals)
@@ -1019,11 +1150,13 @@ be retried safely from the previous cursor."
               (puthash id (cons buffer entry) locals)
               (cond
                (remove
-                (push (list buffer (plist-get entry :begin) (plist-get entry :end) "") edits))
+                (setq edits (append (org-outlook--entry-edits buffer entry nil) edits)))
                ((and event (not (alist-get '@removed event))
-                     (not (equal (alist-get 'changeKey event) (plist-get entry :change))))
-                (push (list buffer (plist-get entry :begin) (plist-get entry :end)
-                            (concat (org-outlook-build-element event) "\n")) edits))))))))
+                     (or (not (plist-get entry :version))
+                         (not (plist-get entry :child))
+                         (plist-get entry :deleted)
+                         (not (equal (alist-get 'changeKey event) (plist-get entry :change)))))
+                (setq edits (append (org-outlook--entry-edits buffer entry event) edits)))))))))
     (maphash
      (lambda (id event)
        (unless (or (gethash id locals) (alist-get '@removed event))
@@ -1149,57 +1282,6 @@ Other fetch or local errors propagate without advancing the saved cursor."
                (org-outlook-full-sync)
              (signal (car err) (cdr err)))))))))
 
-(defun org-outlook-create-teams-meeting (subject start-time end-time)
-  "Create a standalone Teams meeting with SUBJECT, START-TIME and END-TIME.
-Times must be ISO 8601 strings with offsets.  Signal on Graph failure."
-  (org-outlook--graph-data
-   'post org-outlook-teams-meeting-url
-   :body `(("subject" . ,subject)
-           ("startDateTime" . ,start-time)
-           ("endDateTime" . ,end-time))))
-
-(defun org-outlook-format-teams-meeting-body (teams-data)
-  "Format Teams meeting info for org-mode body text.
-TEAMS-DATA is the response from org-outlook-create-teams-meeting."
-  (when teams-data
-    (let* ((join-url (assoc-default 'joinWebUrl teams-data))
-           (meeting-id (assoc-default 'joinMeetingId
-                                     (assoc-default 'joinMeetingIdSettings teams-data)))
-           (passcode (assoc-default 'passcode
-                                   (assoc-default 'joinMeetingIdSettings teams-data)))
-           (organizer-id (assoc-default 'id
-                                       (assoc-default 'user
-                                                     (assoc-default 'identity
-                                                                   (assoc-default 'organizer
-                                                                                 (assoc-default 'participants teams-data))))))
-           (tenant-id (when join-url
-                        (if (string-match "Tid%22%3a%22\\([^%]*\\)" join-url)
-                            (match-string 1 join-url)
-                          "")))
-           (thread-id (assoc-default 'threadId (assoc-default 'chatInfo teams-data)))
-           (meeting-options-url (when (and organizer-id tenant-id thread-id)
-                                  (format "https://teams.microsoft.com/meetingOptions/?organizerId=%s&tenantId=%s&threadId=%s&messageId=0&language=en-GB"
-                                         organizer-id tenant-id thread-id))))
-      (format "________________________________________________________________________________
-
-Microsoft Teams [[https://aka.ms/JoinTeamsMeeting?omkt=en-GB][Need help?]]
-
-[[%s][Join the meeting now]]
-
-%s%s
-
---------------
-
-For organisers:
-%s
-
-________________________________________________________________________________"
-              (or join-url "#")
-              (if meeting-id (format "Meeting ID: %s\n\n" meeting-id) "")
-              (if passcode (format "Passcode: %s\n" passcode) "")
-              (if meeting-options-url
-                  (format "[[%s][Meeting options]]" meeting-options-url)
-                "Meeting options")))))
 
 (defun org-outlook-check-availability (schedules start-time end-time &optional availability-interval)
   "Check SCHEDULES between START-TIME and END-TIME.

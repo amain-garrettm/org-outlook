@@ -6,13 +6,18 @@
 
 (defun org-outlook-test-entry (id &optional date change)
   "Render a managed test headline for ID, DATE and CHANGE."
-  (format "** MEETING %s\n:PROPERTIES:\n:ID: %s\n:OUTLOOK-ID: %s\n:CHANGEKEY: %s\n:END:\n<%s Thu 09:00-10:00>\n"
+  (format "** MEETING %s\n:PROPERTIES:\n:ID: %s\n:OUTLOOK-ID: %s\n:CHANGEKEY: %s\n:OUTLOOK-SYNC-VERSION: 1\n:END:\n*** Outlook: %s\n:PROPERTIES:\n:OUTLOOK-MANAGED-ID: %s\n:END:\n<%s Thu 09:00-10:00>\n"
           id (secure-hash 'sha256 id) id (or change "old")
+          id id
           (or date "2026-10-22")))
 
 (defun org-outlook-test-event (id &optional change)
   "Create a minimal test event with ID and CHANGE."
-  `((id . ,id) (changeKey . ,(or change "new"))))
+  (copy-tree `((id . ,id) (changeKey . ,(or change "new")) (subject . ,id)
+    (isCancelled . :json-false)
+    (start . ((dateTime . "2026-10-22T09:00:00") (timeZone . "Europe/Berlin")))
+    (end . ((dateTime . "2026-10-22T10:00:00") (timeZone . "Europe/Berlin")))
+    (body . ((contentType . "text") (content . "Remote description"))))))
 
 (defun org-outlook-test-batch (events)
   "Create a fetched test round with EVENTS."
@@ -82,7 +87,8 @@ Stub event rendering and ID persistence, but use real Org buffers and saves."
     (let ((main (org-outlook-test-file-text org-outlook-file))
           (other (org-outlook-test-file-text refiled)))
       (should-not (string-match-p ":OUTLOOK-ID: stale\n" main))
-      (should-not (string-match-p "refiled-stale" other))
+      (should-not (string-match-p ":OUTLOOK-ID: refiled-stale" other))
+      (should (string-match-p ":OUTLOOK-RETIRED-ID: refiled-stale" other))
       (should (string-match-p ":OUTLOOK-ID: history" main))
       (should (string-match-p "Personal note" main))
       (should (string-match-p ":OUTLOOK-ID: manual" main))
@@ -264,18 +270,19 @@ Stub event rendering and ID persistence, but use real Org buffers and saves."
           (should-error (org-outlook-sync) :type 'org-outlook-graph-error)
           (should (= 0 full)))))))
 
-(ert-deftest org-outlook-sync-overlapping-managed-entries-abort ()
+(ert-deftest org-outlook-sync-nested-managed-events-survive-parent-retirement ()
   (org-outlook-test-with-files
     (org-outlook-test-append-entry org-outlook-file "parent")
     (with-current-buffer (get-file-buffer org-outlook-file)
       (goto-char (point-max))
-      (insert "*" (org-outlook-test-entry "child"))
+      (insert (org-outlook--nest-body (org-outlook-test-entry "child") 2))
       (save-buffer))
-    (let ((before (org-outlook-test-file-text org-outlook-file)))
-      (should-error
-       (org-outlook--apply-sync-batch
-        (org-outlook-test-batch (list (org-outlook-test-event "child" "old"))) t))
-      (should (equal before (org-outlook-test-file-text org-outlook-file))))))
+    (org-outlook--apply-sync-batch
+     (org-outlook-test-batch (list (org-outlook-test-event "child" "old"))) t)
+    (should (string-match-p ":OUTLOOK-ID: child"
+                            (org-outlook-test-file-text org-outlook-file)))
+    (should (string-match-p ":OUTLOOK-RETIRED-ID: parent"
+                            (org-outlook-test-file-text org-outlook-file)))))
 
 (ert-deftest org-outlook-sync-application-error-rolls-back-buffer-edits ()
   (org-outlook-test-with-files
