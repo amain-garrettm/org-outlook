@@ -777,8 +777,9 @@ Returns non-nil if Teams desktop app is detected."
 		 )))
 
 (defun org-outlook-finalize-capture ()
-  "Finalize only captures made with the Outlook template."
+  "Finalize Outlook captures unless the capture is being aborted."
   (when (and (bound-and-true-p org-capture-mode)
+             (not (bound-and-true-p org-note-abort))
              (org-capture-get :org-outlook))
     (save-excursion
       (goto-char (point-min))

@@ -279,6 +279,31 @@
                   (should (string-match-p "server-link" text))))
             (when (bound-and-true-p org-capture-mode) (org-capture-kill))))))))
 
+(ert-deftest org-outlook-capture-abort-skips-availability-and-calendar-write ()
+  (org-outlook-test-with-native-files
+    (let ((org-capture-templates
+           `(("O" "Outlook integration" entry (file ,org-outlook-file)
+              "* Planning\n:PROPERTIES:\n:MEETING-TIME: <2026-10-22 Thu 09:00-10:00>\n:TEAMS-MEETING: no\n:END:\nPersonal capture notes\n"
+              :org-outlook t)))
+          (org-capture-after-finalize-hook nil)
+          (org-capture-before-finalize-hook nil)
+          (original (org-outlook-test-file-text org-outlook-file))
+          availability-checked)
+      (cl-letf (((symbol-function 'org-msg-export-as-html) #'identity)
+                ((symbol-function 'org-outlook-check-capture-availability)
+                 (lambda () (setq availability-checked t))))
+        (org-outlook-test-with-responses (list (org-outlook-test-calendar-response))
+          (unwind-protect
+              (progn
+                (org-capture nil "O")
+                (org-capture-kill)
+                (should-not availability-checked)
+                (should-not calls)
+                (should (equal original (org-outlook-test-file-text org-outlook-file))))
+            (when (bound-and-true-p org-capture-mode)
+              (let ((org-capture-prepare-finalize-hook nil))
+                (org-capture-kill)))))))))
+
 (ert-deftest org-outlook-content-restores-missing-generated-section ()
   (org-outlook-test-with-native-files
     (org-outlook-test-install-native-event org-outlook-file "meeting")
