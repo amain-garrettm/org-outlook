@@ -52,7 +52,7 @@
       (goto-char (point-max))
       (insert "** TODO Legacy :mine:\n:PROPERTIES:\n:ID: "
               (secure-hash 'sha256 "legacy")
-              "\n:OUTLOOK-ID: legacy\n:CHANGEKEY: old\n:CUSTOM: retained\n:END:\n"
+              "\n:OUTLOOK-ID: legacy\n:OUTLOOK-ID-TYPE: immutable\n:CHANGEKEY: old\n:CUSTOM: retained\n:END:\n"
               "<2026-10-22 Thu 09:00-10:00>\nLegacy body and personal notes\n"
               "*** Personal child\nKeep this child\n")
       (save-buffer))

@@ -60,6 +60,7 @@ applications. In this case, unfortunately, you won't be able to use =org-outlook
 ** Dependencies
 
  - [[https://www.gnupg.org/][gnupg]]: org-outlook requires you to have a public/private gpg keypair capable of encryption
+ - Secure OS randomness: =/dev/urandom=, or =openssl= on systems without that device
  - [[http://github.com/lujun9972/html2org.el][html2org]]
  - [[https://github.com/ndwarshuis/org-ml][org-ml]]
  - [[https://github.com/jeremy-compostella/org-msg][org-msg]]
@@ -79,6 +80,13 @@ Registration in Microsoft Entra (Formally Azure Active Directory) via
 - =Calendars.Read= - Read calendar events
 - =Calendars.ReadWrite= - Create and modify calendar events
 - =offline_access= - Maintain access when user is offline
+- =User.Read= - Translate legacy event IDs during migration to immutable IDs
+
+Existing installations need =User.Read= for the ID migration described in
+[[https://learn.microsoft.com/en-us/graph/api/user-translateexchangeids?view=graph-rest-1.0][Microsoft's translateExchangeIds documentation]].
+If this permission is missing or translation is incomplete, sync stops before
+changing local entries. New installations that contain no legacy IDs do not
+need the translation call.
 
 Teams-enabled calendar events use =Calendars.ReadWrite=. The package no longer
 creates standalone online meetings, so =OnlineMeetings.ReadWrite= is not required.
@@ -112,7 +120,7 @@ Installing with [[https://framagit.org/steckerhalter/quelpa][Quelpa]] is easy:
 
   ;; Required settings
   (setq org-outlook-gpg-recipient "you@example.com")
-  (setq org-outlook-local-timezone "Europe/Berlin") ; Your local time zone
+  (setq org-outlook-local-timezone "Europe/Berlin") ; IANA name, e.g. "America/Chicago"
   (setq org-outlook-file "/path/to/outlook.org")
 
   ;; Sync range (number of days)
@@ -167,8 +175,9 @@ Installing with [[https://framagit.org/steckerhalter/quelpa][Quelpa]] is easy:
      available for an idempotent retry.
 
      Reconciliation checks =org-outlook-file= and registered Org ID files, including
-     refiled entries. Only headlines whose =ID= matches the hash of =OUTLOOK-ID= or
-     =OUTLOOK-RETIRED-ID= are managed. Out-of-window history, undated entries, and
+     refiled entries. Managed entries use a verified hash of their current or
+     original Outlook ID. When migrating immutable IDs, =OUTLOOK-LEGACY-ID=
+     preserves the association with existing Org IDs and links. Out-of-window history, undated entries, and
      unrelated headings are retained. Retiring an event removes its generated
      schedule and join link, marks =OUTLOOK-STATUS= as =DELETED=, and retains the
      parent's ID, notes, and personal children. Save local edits before syncing.
@@ -220,6 +229,44 @@ Installing with [[https://framagit.org/steckerhalter/quelpa][Quelpa]] is easy:
      #+END_SRC
 
 ** Tips
+
++ *Authentication:* Each login uses fresh PKCE material and a verified OAuth state.
+  The listener binds only to loopback on port 9004. Timeout, denial, browser
+  failure, and keyboard quit release the listener and timer. Authorization codes
+  stay in memory. Access expiry comes from Microsoft's token response; revoked
+  refresh tokens trigger a new browser login, while transient failures stop.
+  Tenant URLs are computed when used, so settings in =:config= take effect.
+
+  Credentials now share one encrypted =oauth= cache record scoped to the configured
+  tenant and client. Existing older token records are ignored, so the first use
+  after this upgrade requires browser authorization. Configure
+  =org-outlook-gpg-recipient= before that login. Cache files are saved with mode
+  =0600=. No manual cache deletion is required.
+
++ *Time zones:* Use an installed IANA name for =org-outlook-local-timezone=.
+  Graph requests and stored event instants use UTC; Org display and typed
+  meeting times use the configured zone rather than the system zone. The sync
+  window covers whole local calendar days, including days affected by DST.
+  All-day event end dates are exclusive and render as inclusive Org date ranges.
+
+  Nonexistent and ambiguous local times raise an error. For a meeting in the
+  repeated DST hour, use UTC for capture or pass an explicit ISO offset to
+  programmatic availability functions. Unrecognized server zone names are
+  rejected; map them explicitly with =org-outlook-timezone-aliases= when needed.
+  Changing the display zone rebuilds the tracked view.
+
++ *Calendar moves:* All Graph calls request immutable IDs, which remain stable
+  across calendar moves in the same mailbox. Existing mutable IDs are translated
+  before reconciliation; their Org IDs, notes, and file locations remain intact.
+  Sync currently tracks the default calendar. Moving an event out of that
+  calendar retires its local schedule and retains notes; moving it back restores
+  the same note container. Archive-mailbox moves or export/reimport can still
+  change identity, as described in
+  [[https://learn.microsoft.com/en-us/graph/outlook-immutable-id][Microsoft's immutable-ID documentation]].
+
++ *Agenda files:* List-based =org-agenda-files= includes the Outlook file on load.
+  If =org-agenda-files= names a file containing your agenda list, add the Outlook
+  path to that file yourself; the package preserves this configuration.
 
 + *Keeping personal notes:* Imported entries have a parent headline for your
   TODO state, priority, tags, notes, clocks, and personal children. The child
@@ -305,14 +352,21 @@ Installing with [[https://framagit.org/steckerhalter/quelpa][Quelpa]] is easy:
 + Capture uses one calendar creation request, honors the Teams choice, and stores
   the returned join URL. Standalone Teams creation helpers have been removed.
   Only the Outlook capture template triggers calendar writes during finalization.
++ OAuth validates state, regenerates PKCE material with secure randomness, cleans
+  up all login exit paths, and stores rotated credentials with actual expiry.
++ UTC transport, configured-zone rendering, DST validation, local calendar-day
+  windows, and all-day rendering replace dependence on the process timezone.
++ Immutable IDs and legacy-ID translation preserve Org links across calendar
+  moves. Legacy migration may require adding =User.Read= to the app registration.
++ Agenda actions resolve live source markers without changing source point or
+  narrowing. Missing availability data is reported as unknown rather than free.
 + Regression tests cover Graph transport, sync transactions, note preservation,
-  and calendar capture. With package
+  calendar capture, OAuth, DST, recurring instances, calendar moves, and agenda
+  workflows. With package
   dependencies installed, run:
 
   #+BEGIN_SRC sh
-  emacs --batch --eval "(package-initialize)" -L . -L test \
-    -l org-outlook-graph-test -l org-outlook-sync-test -l org-outlook-content-test \
-    -f ert-run-tests-batch-and-exit
+  emacs --batch --eval "(package-initialize)" -l test/run-tests.el
   #+END_SRC
 
 ** 0.1.4-beta (2026-04-21)

@@ -6,7 +6,7 @@
 
 (defun org-outlook-test-entry (id &optional date change)
   "Render a managed test headline for ID, DATE and CHANGE."
-  (format "** MEETING %s\n:PROPERTIES:\n:ID: %s\n:OUTLOOK-ID: %s\n:CHANGEKEY: %s\n:OUTLOOK-SYNC-VERSION: 1\n:END:\n*** Outlook: %s\n:PROPERTIES:\n:OUTLOOK-MANAGED-ID: %s\n:END:\n<%s Thu 09:00-10:00>\n"
+  (format "** MEETING %s\n:PROPERTIES:\n:ID: %s\n:OUTLOOK-ID: %s\n:CHANGEKEY: %s\n:OUTLOOK-ID-TYPE: immutable\n:OUTLOOK-TIMEZONE: Europe/Berlin\n:OUTLOOK-SYNC-VERSION: 1\n:END:\n*** Outlook: %s\n:PROPERTIES:\n:OUTLOOK-MANAGED-ID: %s\n:END:\n<%s Thu 09:00-10:00>\n"
           id (secure-hash 'sha256 id) id (or change "old")
           id id
           (or date "2026-10-22")))
@@ -103,7 +103,7 @@ Stub event rendering and ID persistence, but use real Org buffers and saves."
     (with-current-buffer (find-file-noselect org-outlook-file)
       (goto-char (point-max))
       (insert "** Undated\n:PROPERTIES:\n:OUTLOOK-ID: undated\n:ID: "
-              (secure-hash 'sha256 "undated") "\n:END:\n")
+              (secure-hash 'sha256 "undated") "\n:OUTLOOK-ID-TYPE: immutable\n:END:\n")
       (save-buffer))
     (org-outlook--apply-sync-batch (org-outlook-test-batch nil) t)
     (should-not (string-match-p ":OUTLOOK-ID: stale" (org-outlook-test-file-text org-outlook-file)))
@@ -241,7 +241,7 @@ Stub event rendering and ID persistence, but use real Org buffers and saves."
         (org-outlook-full-sync-interval-days nil))
     (cl-letf (((symbol-function 'org-id-locations-load) #'ignore)
               ((symbol-function 'org-outlook--sync-state)
-               (lambda () '(:delta "old" :start "2026-10-01" :end "2026-12-31")))
+               (lambda () (list :delta "old" :start "2026-10-01" :end "2026-12-31" :timezone "Europe/Berlin" :id-type "immutable" :tenant org-outlook-tenant-id :client org-outlook-client-id)))
               ((symbol-function 'org-outlook-last-full-sync-time) (lambda () nil))
               ((symbol-function 'org-outlook-start) (lambda () "2026-10-02"))
               ((symbol-function 'org-outlook-end) (lambda () "2027-01-01"))
@@ -256,7 +256,7 @@ Stub event rendering and ID persistence, but use real Org buffers and saves."
     (let ((full 0) (org-outlook-full-sync-interval-days nil))
       (cl-letf (((symbol-function 'org-id-locations-load) #'ignore)
                 ((symbol-function 'org-outlook--sync-state)
-                 (lambda () '(:delta "old" :start "2026-10-01" :end "2026-12-31")))
+                 (lambda () (list :delta "old" :start "2026-10-01" :end "2026-12-31" :timezone "Europe/Berlin" :id-type "immutable" :tenant org-outlook-tenant-id :client org-outlook-client-id)))
                 ((symbol-function 'org-outlook-last-full-sync-time) (lambda () nil))
                 ((symbol-function 'org-outlook-start) (lambda () "2026-10-01"))
                 ((symbol-function 'org-outlook-end) (lambda () "2026-12-31"))
@@ -335,8 +335,8 @@ Stub event rendering and ID persistence, but use real Org buffers and saves."
       (org-mode)
       (insert "** Boundary\n<2026-10-01 Thu 01:00-01:30>\n")
       (goto-char (point-min))
-      ;; Both times are on September 30 in UTC, outside the October window.
-      (should-not (org-outlook--entry-in-window-p "2026-10-01" "2026-12-31")))))
+      ;; Local October 1 is included even though UTC is still September 30.
+      (should (org-outlook--entry-in-window-p "2026-10-01" "2026-12-31")))))
 
 (provide 'org-outlook-sync-test)
 ;;; org-outlook-sync-test.el ends here

@@ -219,6 +219,8 @@ Registration in Microsoft Entra (Formally Azure Active Directory) via
 @samp{Calendars.ReadWrite} - Create and modify calendar events
 @item
 @samp{offline_access} - Maintain access when user is offline
+@item
+@samp{User.Read} - Translate legacy event IDs during migration to immutable IDs
 @end itemize
 
 Teams-enabled calendar events and availability checks use @samp{Calendars.ReadWrite}.
@@ -402,6 +404,29 @@ Creates the event in Outlook if proceeding
 
 @node Tips
 @section Tips
+
+Each login uses fresh secure PKCE material and verified state. The callback
+listener binds only to loopback and releases its timer and listener on every
+exit path. Token expiry comes from Microsoft; revoked refresh tokens trigger
+browser login while transient failures stop. The first use after this upgrade
+requires one login to populate the new encrypted, tenant/client-scoped
+@samp{oauth} record. Old cache records are ignored; no deletion is required.
+Secure randomness requires @samp{/dev/urandom} or @samp{openssl}.
+
+Use an installed IANA name for @samp{org-outlook-local-timezone}. Graph transport
+and stored instants use UTC. Org display and typed meeting times use the
+configured zone. Sync windows cover whole local days, including DST changes;
+all-day events honor exclusive end dates. Nonexistent or ambiguous local times
+are rejected. Use UTC capture or explicit offsets in programmatic inputs for
+the repeated DST hour. Configure @samp{org-outlook-timezone-aliases} for server
+zone names that are not recognized.
+
+Graph calls request immutable IDs. Legacy ID translation requires
+@samp{User.Read} and preserves existing Org IDs and notes. An unsuccessful
+translation stops before local changes. Only the default calendar is tracked:
+moving an event out retires its schedule and retains notes, and moving it back
+restores the same note container. File-backed agenda lists are preserved;
+add the Outlook path to your agenda-list file yourself.
 
 Imported parent headlines hold your TODO state, tags, notes, clocks, and
 personal children. Sync replaces only reserved Outlook properties and the

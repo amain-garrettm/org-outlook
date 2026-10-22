@@ -191,7 +191,7 @@ Expose CALLS and REFRESHES to BODY.  No network or token cache is used."
 (ert-deftest org-outlook-graph-timezone-header-is-escaped-for-curl-config ()
   (org-outlook-test-with-responses (list (org-outlook-test-response 200 "{\"value\":[]}"))
     (org-outlook-retrieve-events)
-    (should (equal (concat "outlook.timezone=\\\"" org-outlook-local-timezone "\\\"")
+    (should (equal "IdType=\\\"ImmutableId\\\", outlook.timezone=\\\"UTC\\\""
                    (cdr (assoc "Prefer" (plist-get (nth 2 (car calls)) :headers)))))))
 
 (provide 'org-outlook-graph-test)

@@ -35,6 +35,10 @@
 (require 'json)
 (require 'url-parse)
 (require 'org-id)
+(require 'calendar)
+(require 'iso8601)
+(require 'subr-x)
+(require 'seq)
 (require 'plz)
 (require 'org-msg)
 (require 'plstore)
@@ -106,7 +110,12 @@ including throttling and server errors, are returned without replaying
 potentially non-idempotent writes.  No tokens or response bodies are logged."
   (unless (org-outlook--graph-url-p url)
     (error "Refusing to send Graph credentials to an untrusted URL"))
-  (let ((payload (and body (json-encode body))) result (attempt 0))
+  (let* ((payload (and body (json-encode body)))
+         (prefer (cdr (assoc-string "Prefer" headers t)))
+         (headers (cons (cons "Prefer" (concat "IdType=\"ImmutableId\""
+                                              (when prefer (concat ", " prefer))))
+                        (cl-remove-if (lambda (header) (equal (downcase (car header)) "prefer")) headers)))
+         result (attempt 0))
     (while (< attempt 2)
       (setq attempt (1+ attempt))
       (setq result
@@ -154,245 +163,322 @@ The condition contains a safe message and the typed result."
 (defvar org-outlook-tenant-id "organizations" "If you provide your own App Registration you can optionally set this to only your outlook tenant (see README.org for details).")
 (defvar org-outlook-user-email nil "Your email address for availability checks. Set this to use org-outlook-i-am-available-p.")
 
-(defvar org-outlook-auth-url (format "https://login.microsoftonline.com/%s/oauth2/v2.0/authorize" org-outlook-tenant-id))
-(setq org-outlook-token-url (format "https://login.microsoftonline.com/%s/oauth2/v2.0/token" org-outlook-tenant-id))
+(define-error 'org-outlook-auth-error "Outlook authentication failed")
+(defvar org-outlook-gpg-recipient nil "GPG recipient for cached OAuth credentials.")
+(defvar org-outlook-auth-timeout 300 "Seconds to wait for browser authorization.")
+(defconst org-outlook--redirect-uri "http://localhost:9004")
+(defvar org-outlook--auth-running nil)
+(defvar org-outlook--auth-server nil)
+(defvar org-outlook--auth-timer nil)
+(defvar org-outlook--auth-state nil)
+(defvar org-outlook--auth-code nil)
+(defvar org-outlook--auth-error nil)
+(defvar org-outlook--auth-complete nil)
+
+(defun org-outlook--oauth-url (operation)
+  "Build the current tenant's OAuth OPERATION URL at request time."
+  (unless (string-match-p "\\`[A-Za-z0-9.-]+\\'" org-outlook-tenant-id)
+    (user-error "Invalid Outlook tenant ID"))
+  (format "https://login.microsoftonline.com/%s/oauth2/v2.0/%s"
+          org-outlook-tenant-id operation))
 
 (defun org-outlook-generate-random-string (length)
-  "Generate a random string of LENGTH consisting of URL-safe characters."
-  (let ((chars "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
-        (result ""))
-    (dotimes (_ length)
-      (setq result (concat result (string (aref chars (random (length chars)))))))
-    result))
+  "Generate LENGTH URL-safe characters using OS randomness or OpenSSL."
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (cond
+     ((file-readable-p "/dev/urandom")
+      (insert-file-contents-literally "/dev/urandom" nil nil length))
+     ((executable-find "openssl")
+      (let ((coding-system-for-read 'binary))
+        (unless (eq 0 (call-process "openssl" nil t nil "rand" (number-to-string length)))
+          (signal 'org-outlook-auth-error '("Secure random generation failed")))))
+     (t (signal 'org-outlook-auth-error '("OAuth requires /dev/urandom or OpenSSL"))))
+    (unless (= length (buffer-size))
+      (signal 'org-outlook-auth-error '("Secure random source returned too few bytes")))
+    (substring (base64url-encode-string (buffer-string)) 0 length)))
 
-(setq org-outlook-code-verifier (org-outlook-generate-random-string 43))
-(setq org-outlook-code-challenge (substring (base64url-encode-string (secure-hash 'sha256 org-outlook-code-verifier nil nil t)) 0 43))
-;(setq org-outlook-code-challenge org-outlook-code-verifier)
-
-;; OAuth state tracking variables
-(defvar org-outlook--auth-server nil "Web server instance for OAuth.")
-(defvar org-outlook--auth-complete nil "Semaphore for OAuth completion.")
-(defvar org-outlook--auth-timer nil "Timer for OAuth timeout.")
-
-;;
-(defun n-days-ago (&optional n)
-  (let* ((days (or n 90))
-         (timestamp (time-subtract (current-time) (days-to-time days))))
-    (list
-     (string-to-number (format-time-string "%m" timestamp))
-     (string-to-number (format-time-string "%d" timestamp))
-     (string-to-number (format-time-string "%Y" timestamp)))))
-
-(defun token-timed-out (&optional token)
-  (let* ((token (or token "access"))
-	 (org-outlook-token-cache (plstore-open (expand-file-name org-outlook-token-cache-file)))
-	 (auth-timestamp (plist-get (cdr (plstore-get org-outlook-token-cache token)) :timestamp))
-	 (timeout-seconds (if (string= token "refresh")
-			      (* 89 24 60 60)  ; 89 days in seconds
-			    3599)))            ; 1 hour for access tokens
-    (plstore-close org-outlook-token-cache)
-    (if auth-timestamp
-	(time-less-p (time-add (parse-iso8601-time-string auth-timestamp) (seconds-to-time timeout-seconds))  (current-time))
-      t)))  ; No timestamp means unknown state - treat as timed out
-
-(defun token-cache-exists ()
-  (file-regular-p org-outlook-token-cache-file))
-
-(defun org-outlook-start ()
-  (format-time-string "%Y-%m-%d" (time-subtract (current-time)(days-to-time org-outlook-sync-start))))
-
-(defun org-outlook-end ()
-  (format-time-string "%Y-%m-%d" (time-subtract (current-time)(days-to-time (* -1 org-outlook-sync-end)))))
-
-(defun org-outlook-start-time-from-timestamp (ts)
-  (let* ((tobject (cadr (org-timestamp-from-string ts)))
-	 (year-start (plist-get tobject :year-start))
-	 (month-start (plist-get tobject :month-start))
-	 (day-start (plist-get tobject :day-start))
-	 (hour-start (plist-get tobject :hour-start))
-	 (minute-start (plist-get tobject :minute-start)))
-    (format "%s-%02d-%02dT%02d:%02d:00" year-start month-start day-start hour-start minute-start)))
-
-(defun org-outlook-end-time-from-timestamp (ts)
-  (let* ((tobject (cadr (org-timestamp-from-string ts)))
-	 (year-end (plist-get tobject :year-end))
-	 (month-end (plist-get tobject :month-end))
-	 (day-end (plist-get tobject :day-end))
-	 (hour-end (plist-get tobject :hour-end))
-	 (minute-end (plist-get tobject :minute-end)))
-    (format "%s-%02d-%02dT%02d:%02d:00" year-end month-end day-end hour-end minute-end)))
-
+(defun org-outlook--oauth-callback (method path params)
+  "Validate METHOD, PATH and decoded PARAMS and return a safe HTTP reply.
+Wrong state leaves the pending login untouched.  Codes stay in memory."
+  (cond
+   ((not (and (eq method 'GET) (equal path "/"))) '(404 . "Not found"))
+   ((or (not org-outlook--auth-running) org-outlook--auth-complete)
+    '(409 . "No pending authorization"))
+   ((or (/= 1 (cl-count "state" params :key #'car :test #'equal))
+        (not (equal (cdr (assoc "state" params)) org-outlook--auth-state)))
+    '(400 . "Invalid authorization state"))
+   ((assoc "error" params)
+    (setq org-outlook--auth-error "Authorization was denied or cancelled"
+          org-outlook--auth-complete t)
+    '(400 . "Authorization failed. Return to Emacs."))
+   ((and (= 1 (cl-count "code" params :key #'car :test #'equal))
+         (stringp (cdr (assoc "code" params)))
+         (not (string-empty-p (cdr (assoc "code" params)))))
+    (setq org-outlook--auth-code (cdr (assoc "code" params))
+          org-outlook--auth-complete t)
+    '(200 . "Authorization received. Return to Emacs."))
+   (t '(400 . "Missing authorization code"))))
 
 (defun process-token-callback (request)
-  "Process OAuth callback and signal completion."
-  (with-slots (process headers) request
-    (ws-response-header process 200 '("Content-type" . "text/html"))
-    (let ((auth-code (cdr (assoc "code" (headers request)))))
-      (if auth-code
-          (progn
-            (org-outlook-set-token-field "auth" nil `(:auth ,auth-code))
-            (setq org-outlook--auth-complete t)
-            (when org-outlook--auth-timer
-              (cancel-timer org-outlook--auth-timer))
-            (process-send-string process
-                                 "<html><body><h2>Authentication successful!</h2><p>You can close this window and return to Emacs.</p></body></html>"))
-        (process-send-string process
-                             "<html><body><h2>Authentication failed</h2><p>No authorization code received.</p></body></html>")))))
+  "Handle web-server REQUEST without echoing or storing authorization codes."
+  (let* ((path (cdr (assq :GET (ws-headers request))))
+         ;; Parse raw query once: web-server's header parser decodes twice.
+         (raw (car (split-string (ws-pending request) "\r\n")))
+         (query (and (string-match "\\`GET [^ ?]*[?]\\([^ ]*\\) HTTP/" raw)
+                     (match-string 1 raw)))
+         (params (mapcan (lambda (pair)
+                           (mapcar (lambda (value) (cons (car pair) value)) (cdr pair)))
+                         (url-parse-query-string (or query ""))))
+         (reply (org-outlook--oauth-callback (and path 'GET) path params))
+         (process (ws-process request)))
+    (ws-response-header process (car reply)
+                        '("Content-Type" . "text/plain; charset=utf-8")
+                        '("Cache-Control" . "no-store"))
+    (process-send-string process (cdr reply))))
 
 (defun start-auth-code-server ()
-  (ws-start
-   '(((:GET . ".*") .
-      (lambda (request)
-	(process-token-callback request)
-	)))
-   9004))
+  "Listen on loopback only, with request logging disabled."
+  (ws-start #'process-token-callback 9004 nil :host "127.0.0.1"))
 
 (defun org-outlook-set-token-field (type public secret)
-  (let
-      ((org-outlook-token-cache (plstore-open (expand-file-name org-outlook-token-cache-file)))
-       (plstore-encrypt-to org-outlook-gpg-recipient))
-    (plstore-put org-outlook-token-cache type public secret)
-    (plstore-save org-outlook-token-cache)
-    (plstore-close org-outlook-token-cache)
-    ))
+  "Save PUBLIC and encrypted SECRET under TYPE, closing the store on error."
+  (let* ((file (expand-file-name org-outlook-token-cache-file))
+         (plstore-encrypt-to org-outlook-gpg-recipient) cache)
+    (when (and secret (not org-outlook-gpg-recipient))
+      (user-error "Set org-outlook-gpg-recipient before saving OAuth credentials"))
+    (make-directory (file-name-directory file) t)
+    (setq cache (plstore-open file))
+    (unwind-protect
+        (progn (plstore-put cache type public secret) (plstore-save cache)
+               (set-file-modes file #o600))
+      (plstore-close cache))))
 
 (defun org-outlook-request-authorization ()
-  "Request OAuth authorization without blocking Emacs.
-Opens the browser and waits for the callback with a 5-minute timeout.
-Returns the authorization code on success."
-  (let* ((outlook-auth-url
-          (concat org-outlook-auth-url
-                  "?client_id=" (url-hexify-string org-outlook-client-id)
-                  "&response_type=code"
-		  "&code_challenge=" org-outlook-code-challenge
-		  "&code_challenge_method=S256"
-                  "&redirect_uri=" (url-hexify-string "http://localhost:9004")
-                  "&scope=" (url-hexify-string (concat "offline_access " org-outlook-resource-url)))))
+  "Return a fresh authorization code and PKCE verifier after a bounded login.
+Always release the listener and timer, including on cancellation or quit."
+  (when org-outlook--auth-running (user-error "Outlook authorization is already running"))
+  (let* ((org-outlook--auth-running t)
+         (org-outlook--auth-server nil) (org-outlook--auth-timer nil)
+         (org-outlook--auth-state (org-outlook-generate-random-string 43))
+         (org-outlook--auth-code nil) (org-outlook--auth-error nil)
+         (org-outlook--auth-complete nil)
+         (verifier (org-outlook-generate-random-string 43))
+         (challenge (replace-regexp-in-string
+                     "=+\\'" "" (base64url-encode-string
+                                 (secure-hash 'sha256 verifier nil nil t))))
+         (url (concat (org-outlook--oauth-url "authorize") "?"
+                      (org-outlook--build-query-string
+                       `(("client_id" . ,org-outlook-client-id) ("response_type" . "code")
+                         ("redirect_uri" . ,org-outlook--redirect-uri)
+                         ("scope" . ,(concat "offline_access " org-outlook-resource-url))
+                         ("state" . ,org-outlook--auth-state)
+                         ("code_challenge" . ,challenge) ("code_challenge_method" . "S256"))))))
+    (unwind-protect
+        (progn
+          (setq org-outlook--auth-server (start-auth-code-server)
+                org-outlook--auth-timer
+                (run-at-time org-outlook-auth-timeout nil
+                             (lambda ()
+                               (setq org-outlook--auth-error "Authorization timed out"
+                                     org-outlook--auth-complete t))))
+          (browse-url url)
+          (message "Complete Outlook authorization in your browser")
+          (while (not org-outlook--auth-complete) (accept-process-output nil 0.1))
+          (when org-outlook--auth-error
+            (signal 'org-outlook-auth-error (list org-outlook--auth-error)))
+          (list :code org-outlook--auth-code :verifier verifier))
+      (when org-outlook--auth-timer (cancel-timer org-outlook--auth-timer))
+      (when org-outlook--auth-server (ws-stop org-outlook--auth-server))
+      (setq org-outlook--auth-state nil org-outlook--auth-code nil))))
 
-    ;; Reset state
-    (setq org-outlook--auth-complete nil)
+(defun org-outlook--oauth-cache ()
+  "Read credentials only when their tenant and client match this configuration."
+  (let ((cache (plstore-open (expand-file-name org-outlook-token-cache-file))))
+    (unwind-protect
+        (let ((data (cdr (plstore-get cache "oauth"))))
+          (when (and (equal org-outlook-client-id (plist-get data :client))
+                     (equal org-outlook-tenant-id (plist-get data :tenant)))
+            data))
+      (plstore-close cache))))
 
-    ;; Start server
-    (setq org-outlook--auth-server (start-auth-code-server))
+(defun token-timed-out (&optional token)
+  "Use actual access expiry; Microsoft validates refresh-token revocation."
+  (if (equal token "refresh")
+      (not (plist-get (org-outlook--oauth-cache) :refresh))
+    (let ((expires (plist-get (org-outlook--oauth-cache) :expires)))
+      (or (not expires)
+          (condition-case nil
+              (not (time-less-p (current-time) (parse-iso8601-time-string expires)))
+            (error t))))))
 
-    ;; Set timeout (5 minutes)
-    (setq org-outlook--auth-timer
-          (run-at-time 300 nil
-                       (lambda ()
-                         (when (not org-outlook--auth-complete)
-                           (when org-outlook--auth-server
-                             (ws-stop org-outlook--auth-server))
-                           (setq org-outlook--auth-server nil)
-                           (error "OAuth authorization timed out after 5 minutes")))))
-
-    ;; Open browser (non-blocking)
-    (if (eq system-type 'gnu/linux)
-	(browse-url-xdg-open outlook-auth-url)
-        (browse-url outlook-auth-url))
-
-    (message "Please complete authentication in your browser (you have 5 minutes)...")
-
-    ;; Wait for completion with non-blocking checks
-    (while (not org-outlook--auth-complete)
-      (accept-process-output nil 0.1))
-
-    ;; Cleanup
-    (when org-outlook--auth-server
-      (ws-stop org-outlook--auth-server))
-    (setq org-outlook--auth-server nil)
-    (when org-outlook--auth-timer
-      (cancel-timer org-outlook--auth-timer))
-    (setq org-outlook--auth-timer nil)
-
-    (message "Authentication successful!")
-    (org-outlook-auth-token)))
-
-(defun org-outlook-auth-token ()
-  (let*
-      ((org-outlook-token-cache (plstore-open (expand-file-name org-outlook-token-cache-file)))
-       (token (plist-get (cdr (plstore-get org-outlook-token-cache "auth")) :auth)))
-    (plstore-close org-outlook-token-cache)
-    token))
+(defun token-cache-exists ()
+  (file-regular-p (expand-file-name org-outlook-token-cache-file)))
 
 (defun org-outlook-access-token ()
-  (let*
-      ((org-outlook-token-cache (plstore-open (expand-file-name org-outlook-token-cache-file)))
-       (token (plist-get (cdr (plstore-get org-outlook-token-cache "access")) :access)))
-    (plstore-close org-outlook-token-cache)
-    token))
+  (plist-get (org-outlook--oauth-cache) :access))
 
 (defun org-outlook-refresh-token ()
-  (let* ((org-outlook-token-cache (plstore-open (expand-file-name org-outlook-token-cache-file)))
-         (token (plist-get (cdr (plstore-get org-outlook-token-cache "refresh")) :refresh)))
-    (plstore-close org-outlook-token-cache)
-    (and token (not (token-timed-out "refresh")) token)))
+  (plist-get (org-outlook--oauth-cache) :refresh))
+
+(defun org-outlook--exchange-token (pairs)
+  "Exchange form PAIRS without logging credentials or server diagnostics."
+  (condition-case err
+      (org-outlook--graph-response
+       (plz 'post (org-outlook--oauth-url "token")
+         :headers '(("Content-Type" . "application/x-www-form-urlencoded"))
+         :body (org-outlook--build-query-string pairs) :as 'response :timeout 60))
+    (plz-error
+     (let ((detail (cadr err)))
+       (org-outlook--graph-response
+        (and (plz-error-p detail) (plz-error-response detail)) t)))))
 
 (defun org-outlook-request-access-token ()
-  (let* ((refresh_token (org-outlook-refresh-token))
-	 (auth_code (or refresh_token
-			(progn
-			  (org-outlook-request-authorization)
-			  ;(message "retrieved auth token")
-    			  ;(org-outlook-auth-token)
-			  )
-			)))
-    (message "Token exchange: grant_type=%s"
-	     (if refresh_token "refresh_token" "authorization_code"))
-    (let* ((data-pairs
-	    (append
-	     `(("tenant" . ,org-outlook-tenant-id)
-	       ("client_id" . ,org-outlook-client-id)
-	       ("scope" . ,(concat "offline_access " org-outlook-resource-url))
-	       ,(if refresh_token
-		    `("refresh_token" . ,refresh_token)
-		  `("code" . ,auth_code))
-	       ("redirect_uri" . "http://localhost:9004")
-	       ,(if refresh_token
-		    '("grant_type" . "refresh_token")
-		  '("grant_type" . "authorization_code")))
-	     (unless refresh_token
-	       `(("code_verifier" . ,org-outlook-code-verifier)))))
-	   (post-body
-	    (mapconcat
-	     (lambda (pair)
-	       (concat (url-hexify-string (car pair))
-		       "="
-		       (url-hexify-string (cdr pair))))
-	     data-pairs "&"))
-	   (data
-	    (condition-case err
-		(plz 'post org-outlook-token-url
-		  :headers '(("Content-Type" . "application/x-www-form-urlencoded"))
-		  :body post-body
-		  :as #'json-read)
-	      (plz-error
-	       (message "Token exchange error: %S" err)
-	       nil))))
-      (if (and data (assoc-default 'access_token data))
-	  (progn
-	    (org-outlook-set-token-field "access"
-					`(:timestamp ,(format-time-string "%Y-%m-%dT%H:%M:%S" (current-time)))
-					`(:access ,(assoc-default 'access_token data)))
-	    (org-outlook-set-token-field "refresh"
-					`(:timestamp ,(format-time-string "%Y-%m-%dT%H:%M:%S" (current-time)))
-					`(:refresh ,(assoc-default 'refresh_token data)))
-	    (message "Token exchange successful"))
-	(message "Token exchange FAILED: %s"
-		 (or (and data (assoc-default 'error_description data))
-		     (and data (assoc-default 'error data))
-		     "no response or no access_token in response"))
-	(error "Failed to get access token")))))
+  "Refresh access; reauthenticate only for revoked or interaction-required grants.
+Save rotated credentials and the server's expiry in one encrypted cache write."
+  (let* ((refresh (org-outlook-refresh-token))
+         (common `(("client_id" . ,org-outlook-client-id)
+                   ("scope" . ,(concat "offline_access " org-outlook-resource-url))))
+         (result (when refresh
+                   (org-outlook--exchange-token
+                    (append common `(("grant_type" . "refresh_token")
+                                      ("refresh_token" . ,refresh))))))
+         (data (and result (org-outlook-graph-result-data result))))
+    (when (or (not refresh)
+              (and (memq (org-outlook-graph-result-status result) '(400 401))
+                   (member (alist-get 'error data)
+                           '("invalid_grant" "interaction_required" "login_required" "consent_required"))))
+      (setq refresh nil)
+      (let ((authorization (org-outlook-request-authorization)))
+        (setq result
+              (org-outlook--exchange-token
+               (append common
+                       `(("grant_type" . "authorization_code")
+                         ("redirect_uri" . ,org-outlook--redirect-uri)
+                         ("code" . ,(plist-get authorization :code))
+                         ("code_verifier" . ,(plist-get authorization :verifier)))))
+              data (org-outlook-graph-result-data result))))
+    (when (org-outlook-graph-result-error result)
+      (signal 'org-outlook-auth-error
+              (list (format "Token exchange failed (%s, HTTP %s)"
+                            (org-outlook-graph-result-error result)
+                            (or (org-outlook-graph-result-status result) "none")))))
+    (let ((access (alist-get 'access_token data)) (lifetime (alist-get 'expires_in data)))
+      (unless (and (stringp access) (not (string-empty-p access))
+                   (numberp lifetime) (> lifetime 0))
+        (signal 'org-outlook-auth-error '("Invalid token response")))
+      (org-outlook-set-token-field
+       "oauth"
+       (list :client org-outlook-client-id :tenant org-outlook-tenant-id
+             :expires (format-time-string
+                       "%Y-%m-%dT%H:%M:%SZ"
+                       (time-add (current-time)
+                                 (seconds-to-time (- lifetime (min 30 (/ lifetime 2))))) t))
+       (list :access access :refresh (or (alist-get 'refresh_token data) refresh)))
+      access)))
 
 (defun org-outlook-force-token-refresh ()
-  "Force a fresh token by clearing the access token timestamp and re-requesting."
-  (message "Forcing token refresh...")
+  "Refresh access once without logging credentials."
   (org-outlook-request-access-token))
 
 (defun org-outlook-bearer-token ()
-  "Return a valid access token without logging credentials."
-  (when (or (token-timed-out) (not (token-cache-exists)))
-    (org-outlook-request-access-token))
-  (org-outlook-access-token))
+  "Return a usable access token without logging credentials."
+  (if (or (token-timed-out) (not (org-outlook-access-token)))
+      (org-outlook-request-access-token)
+    (org-outlook-access-token)))
+
+(defvar org-outlook-timezone-aliases nil
+  "Explicit mappings from server time-zone names to installed IANA names.")
+
+(defun org-outlook--timezone (zone)
+  "Resolve ZONE without silently treating an unknown IANA name as UTC."
+  (let ((name (or (cdr (assoc zone org-outlook-timezone-aliases)) zone "UTC")))
+    (when (or (string-match-p "[ \t\r\n]" name)
+              (and (file-directory-p "/usr/share/zoneinfo")
+                   (not (file-exists-p (expand-file-name name "/usr/share/zoneinfo")))))
+      (user-error "Unknown time zone %s; use an IANA name or configure an alias" name))
+    name))
+
+(defun org-outlook--parse-time (string &optional zone strict)
+  "Parse ISO STRING in ZONE when it lacks an explicit UTC offset.
+STRICT rejects nonexistent and ambiguous wall times instead of guessing
+across a DST transition.  Explicit offsets always identify an instant."
+  (unless (and (stringp string)
+               (string-match-p
+                "\\`[0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}T[0-9]\\{2\\}:[0-9]\\{2\\}:[0-9]\\{2\\}\\(?:\\.[0-9]+\\)?\\(?:Z\\|[+-][0-9]\\{2\\}:[0-9]\\{2\\}\\)?\\'" string))
+    (user-error "Expected an ISO date and time, optionally with a UTC offset"))
+  (if (string-match-p "\\(?:Z\\|[+-][0-9]\\{2\\}:[0-9]\\{2\\}\\)\\'" string)
+      (parse-iso8601-time-string string)
+    (let* ((zone (org-outlook--timezone zone))
+           (parts (parse-time-string string))
+           (time (encode-time (nth 0 parts) (nth 1 parts) (nth 2 parts)
+                              (nth 3 parts) (nth 4 parts) (nth 5 parts) zone))
+           (wall (substring string 0 19))
+           (format "%Y-%m-%dT%H:%M:%S"))
+      (unless (equal wall (format-time-string format time zone))
+        (user-error "Invalid or nonexistent local time in %s" zone))
+      (when (and strict
+                 (seq-some
+                  (lambda (offset)
+                    (equal wall (format-time-string
+                                 format (time-add time (seconds-to-time offset)) zone)))
+                  '(-7200 -3600 -1800 1800 3600 7200)))
+        (user-error "Ambiguous local time in %s; provide an explicit UTC offset" zone))
+      time)))
+
+(defun org-outlook--event-time (date-time)
+  "Parse a Graph dateTimeTimeZone DATE-TIME object."
+  (org-outlook--parse-time (alist-get 'dateTime date-time)
+                          (or (alist-get 'timeZone date-time) "UTC")))
+
+(defun org-outlook--utc-string (time)
+  "Format TIME for an unambiguous Graph request."
+  (format-time-string "%Y-%m-%dT%H:%M:%SZ" time t))
+
+(defun org-outlook--shift-date (date days)
+  "Shift calendar DATE by DAYS, independent of 23/25-hour days."
+  (let* ((parts (mapcar #'string-to-number (split-string date "-")))
+         (calendar (list (nth 1 parts) (nth 2 parts) (nth 0 parts)))
+         (shifted (calendar-gregorian-from-absolute
+                   (+ days (calendar-absolute-from-gregorian calendar)))))
+    (format "%04d-%02d-%02d" (nth 2 shifted) (car shifted) (nth 1 shifted))))
+
+(defun org-outlook-start ()
+  "Return the first sync date in the configured zone."
+  (org-outlook--shift-date
+   (format-time-string "%Y-%m-%d" nil (org-outlook--timezone org-outlook-local-timezone))
+   (- org-outlook-sync-start)))
+
+(defun org-outlook-end ()
+  "Return the last inclusive sync date in the configured zone."
+  (org-outlook--shift-date
+   (format-time-string "%Y-%m-%d" nil (org-outlook--timezone org-outlook-local-timezone))
+   org-outlook-sync-end))
+
+(defun org-outlook--window-boundary (date &optional after)
+  "Return the instant at local midnight DATE, or the next day when AFTER."
+  (let* ((parts (mapcar #'string-to-number
+                        (split-string (if after (org-outlook--shift-date date 1) date) "-"))))
+    (encode-time 0 0 0 (nth 2 parts) (nth 1 parts) (nth 0 parts)
+                 (org-outlook--timezone org-outlook-local-timezone))))
+
+(defun org-outlook--timestamp-part (timestamp suffix)
+  "Read the start or end of Org TIMESTAMP using property SUFFIX."
+  (let* ((parts (cadr (org-timestamp-from-string timestamp)))
+         (year (plist-get parts (intern (concat ":year-" suffix))))
+         (month (plist-get parts (intern (concat ":month-" suffix))))
+         (day (plist-get parts (intern (concat ":day-" suffix))))
+         (hour (plist-get parts (intern (concat ":hour-" suffix))))
+         (minute (plist-get parts (intern (concat ":minute-" suffix)))))
+    (unless (and year month day hour minute)
+      (user-error "Meeting time must contain a timed Org timestamp range"))
+    (format "%04d-%02d-%02dT%02d:%02d:00" year month day hour minute)))
+
+(defun org-outlook-start-time-from-timestamp (timestamp)
+  (org-outlook--timestamp-part timestamp "start"))
+
+(defun org-outlook-end-time-from-timestamp (timestamp)
+  (org-outlook--timestamp-part timestamp "end"))
 
 (defun org-outlook-update-meeting-id (id) ;; unused?
   (interactive)
@@ -401,10 +487,13 @@ Returns the authorization code on success."
 	 (org-ml-update (lambda (hl)
 			  (org-ml-headline-set-node-property "ID" id hl))))))
 
-(defun org-outlook-get-appointment-property (prop)
+(cl-defun org-outlook-get-appointment-property (prop)
   "Get PROP from this Org entry or its event parent."
   (unless (derived-mode-p 'org-mode)
-    (user-error "This command must be run from an org-mode buffer"))
+    (if (derived-mode-p 'org-agenda-mode)
+        (cl-return-from org-outlook-get-appointment-property
+          (org-outlook-get-prop-from-agenda prop))
+      (user-error "This command must be run from an Org or agenda buffer")))
   (save-excursion
     (org-back-to-heading t)
     (let ((value (org-entry-get nil prop)))
@@ -429,7 +518,10 @@ transaction ID so a manual retry after an uncertain response is deduplicated."
                   (org-entry-get nil "OUTLOOK-START")))
          (end (if meeting-time (org-outlook-end-time-from-timestamp meeting-time)
                 (org-entry-get nil "OUTLOOK-END")))
+         (start-instant (org-outlook--parse-time start org-outlook-local-timezone t))
+         (end-instant (org-outlook--parse-time end org-outlook-local-timezone t))
          (id (org-entry-get nil "OUTLOOK-ID"))
+         (local-id (org-entry-get nil "ID"))
          (teams (equal "yes" (org-entry-get nil "TEAMS-MEETING")))
          (invitees (org-entry-get nil "INVITEES"))
          (location (org-entry-get nil "LOCATION"))
@@ -443,8 +535,8 @@ transaction ID so a manual retry after an uncertain response is deduplicated."
          (payload
           (append
            `(("subject" . ,title)
-             ("start" . (("dateTime" . ,start) ("timeZone" . ,org-outlook-local-timezone)))
-             ("end" . (("dateTime" . ,end) ("timeZone" . ,org-outlook-local-timezone))))
+             ("start" . (("dateTime" . ,(org-outlook--utc-string start-instant)) ("timeZone" . "UTC")))
+             ("end" . (("dateTime" . ,(org-outlook--utc-string end-instant)) ("timeZone" . "UTC"))))
            (when location `(("location" . (("displayName" . ,location)))))
            (when invitees `(("attendees" . ,(org-outlook-create-attendees-list invitees))))
            (unless id `(("body" . (("contentType" . "HTML") ("content" . ,body)))
@@ -454,7 +546,7 @@ transaction ID so a manual retry after an uncertain response is deduplicated."
            (when teams '(("onlineMeetingProvider" . "teamsForBusiness"))))))
     (when (org-entry-get nil "OUTLOOK-RETIRED-ID")
       (user-error "This event was retired; use a new capture to create a meeting"))
-    (unless (and (stringp start) (stringp end) (string< start end))
+    (unless (time-less-p start-instant end-instant)
       (user-error "Meeting time must include an end later than its start"))
     (unless id (org-entry-put nil "OUTLOOK-TRANSACTION-ID" transaction))
     (let* ((data (org-outlook--graph-data
@@ -462,17 +554,19 @@ transaction ID so a manual retry after an uncertain response is deduplicated."
                   (if id (concat org-outlook-events-create-url "/" (url-hexify-string id))
                     org-outlook-events-create-url)
                   :body payload
-                  :headers `(("Prefer" . ,(format "outlook.timezone=\"%s\"" org-outlook-local-timezone)))))
+                  :headers '(("Prefer" . "outlook.timezone=\"UTC\""))))
            (remote-id (alist-get 'id data))
            (join (alist-get 'joinUrl (alist-get 'onlineMeeting data))))
       (unless (and (stringp remote-id) (not (string-empty-p remote-id)))
         (signal 'org-outlook-graph-error '("Calendar response has no event ID")))
       ;; Retain identity before any further processing can fail.
       (org-entry-put nil "OUTLOOK-ID" remote-id)
-      (org-entry-put nil "ID" (secure-hash 'sha256 remote-id))
+      (org-entry-put nil "ID" (or local-id (secure-hash 'sha256 remote-id)))
+      (when (and id local-id (not (equal local-id (secure-hash 'sha256 remote-id))))
+        (org-entry-put nil "OUTLOOK-LEGACY-ID" (or (org-entry-get nil "OUTLOOK-LEGACY-ID") id)))
       (org-entry-put nil "OUTLOOK-SYNC-VERSION" "1")
       (when join (org-entry-put nil "TEAMSURL" join))
-      (let* ((entry (list :id remote-id :begin (point)))
+      (let* ((entry (list :id (or id remote-id) :begin (point)))
              (edits (org-outlook--entry-edits (current-buffer) entry data)))
         (atomic-change-group
           (save-excursion
@@ -485,22 +579,21 @@ transaction ID so a manual retry after an uncertain response is deduplicated."
       (message "%s Outlook event" (if id "Updated" "Created"))
       data)))
 
-(if (listp org-agenda-files)
-    (add-to-list 'org-agenda-files org-outlook-file)
-  (setq org-agenda-files (list org-outlook-file)))
+(defun org-outlook--register-agenda-file ()
+  "Register Outlook only for a list-based agenda configuration.
+File-backed agenda lists remain under the user's control."
+  (when (listp org-agenda-files)
+    (add-to-list 'org-agenda-files org-outlook-file)))
+
+(org-outlook--register-agenda-file)
 
 (add-to-list 'thing-at-point-uri-schemes "msteams://")
 
-(defun org-outlook-timestamp-to-list (timestamp)
-  "Parse timestamp from Outlook API.
-Timestamps are returned in local timezone due to Prefer header,
-so we parse them as-is without forcing UTC conversion."
-  (let ((timetuple (parse-iso8601-time-string timestamp)))
-    (list (string-to-number (format-time-string "%Y" timetuple))
-	  (string-to-number (format-time-string "%m" timetuple))
-	  (string-to-number (format-time-string "%d" timetuple))
-	  (string-to-number (format-time-string "%H" timetuple))
-	  (string-to-number (format-time-string "%M" timetuple)))))
+(defun org-outlook-timestamp-to-list (timestamp &optional zone)
+  "Convert Graph TIMESTAMP in ZONE (UTC by default) to configured wall time."
+  (let ((parts (decode-time (org-outlook--parse-time timestamp (or zone "UTC"))
+                            (org-outlook--timezone org-outlook-local-timezone))))
+    (list (nth 5 parts) (nth 4 parts) (nth 3 parts) (nth 2 parts) (nth 1 parts))))
 
 (defun org-outlook-convert-html-body (html)
   (with-temp-buffer
@@ -537,8 +630,10 @@ so we parse them as-is without forcing UTC conversion."
       ("OUTLOOK-SUBJECT" . ,(alist-get 'subject event))
       ("OUTLOOK-STATUS" . ,(org-outlook--event-status event))
       ("OUTLOOK-CATEGORIES" . ,(json-encode (or (alist-get 'categories event) [])))
-      ("OUTLOOK-START" . ,(alist-get 'dateTime (alist-get 'start event)))
-      ("OUTLOOK-END" . ,(alist-get 'dateTime (alist-get 'end event)))
+      ("OUTLOOK-START" . ,(org-outlook--utc-string (org-outlook--event-time (alist-get 'start event))))
+      ("OUTLOOK-END" . ,(org-outlook--utc-string (org-outlook--event-time (alist-get 'end event))))
+      ("OUTLOOK-TIMEZONE" . ,org-outlook-local-timezone)
+      ("OUTLOOK-ID-TYPE" . "immutable")
       ("LOCATION" . ,(alist-get 'displayName (alist-get 'location event)))
       ("URL" . ,(alist-get 'webLink event))
       ("TEAMSURL" . ,(alist-get 'joinUrl (alist-get 'onlineMeeting event)))
@@ -554,15 +649,22 @@ so we parse them as-is without forcing UTC conversion."
       (org-entry-delete nil (car property)))))
 
 (defun org-outlook--event-timestamp (event)
-  "Format EVENT as an active Org timestamp without synthetic clock entries."
-  (let* ((start (org-outlook-timestamp-to-list (alist-get 'dateTime (alist-get 'start event))))
-         (end (org-outlook-timestamp-to-list (alist-get 'dateTime (alist-get 'end event))))
-         (date (lambda (parts) (apply #'format "%04d-%02d-%02d" (cl-subseq parts 0 3))))
-         (time (lambda (parts) (format "%02d:%02d" (nth 3 parts) (nth 4 parts)))))
-    (if (equal (cl-subseq start 0 3) (cl-subseq end 0 3))
-        (format "<%s %s-%s>" (funcall date start) (funcall time start) (funcall time end))
-      (format "<%s %s>--<%s %s>" (funcall date start) (funcall time start)
-              (funcall date end) (funcall time end)))))
+  "Render EVENT in the configured zone, respecting exclusive all-day ends."
+  (let* ((zone (org-outlook--timezone org-outlook-local-timezone))
+         (start (org-outlook--event-time (alist-get 'start event)))
+         (end (org-outlook--event-time (alist-get 'end event)))
+         (first (format-time-string "%Y-%m-%d" start zone))
+         (last (format-time-string "%Y-%m-%d" end zone)))
+    (if (eq t (alist-get 'isAllDay event))
+        (let ((last (format-time-string "%Y-%m-%d"
+                                       (time-subtract end (seconds-to-time 1)) zone)))
+          (if (equal first last) (format "<%s>" first)
+            (format "<%s>--<%s>" first last)))
+      (if (equal first last)
+          (format "<%s %s-%s>" first (format-time-string "%H:%M" start zone)
+                  (format-time-string "%H:%M" end zone))
+        (format "<%s %s>--<%s %s>" first (format-time-string "%H:%M" start zone)
+                last (format-time-string "%H:%M" end zone))))))
 
 (defun org-outlook--nest-body (body minimum-level)
   "Keep all BODY headings beneath MINIMUM-LEVEL in a managed subtree."
@@ -727,39 +829,31 @@ Returns t to proceed with event creation, nil if user wants to edit."
 
 
 (defun org-outlook-get-busy-attendees (schedules start-time end-time)
-  "Return list of email addresses that are busy during the specified time slot."
-  (let ((start-time-obj (parse-iso8601-time-string start-time))
-        (end-time-obj (parse-iso8601-time-string end-time))
-        busy-people)
+  "Return schedules whose busy intervals overlap the requested instants."
+  (let ((start (org-outlook--parse-time start-time org-outlook-local-timezone t))
+        (end (org-outlook--parse-time end-time org-outlook-local-timezone t)) busy)
     (dolist (schedule schedules)
-      (let ((schedule-id (assoc-default 'scheduleId schedule))
-            (schedule-items (append (assoc-default 'scheduleItems schedule) nil)))
-        (when (seq-some (lambda (item)
-                          (let ((item-start (parse-iso8601-time-string
-                                           (assoc-default 'dateTime (assoc-default 'start item))))
-                                (item-end (parse-iso8601-time-string
-                                         (assoc-default 'dateTime (assoc-default 'end item))))
-                                (status (assoc-default 'status item)))
-                            ;; Check if item is busy/tentative and overlaps
-                            (and (member status '("busy" "tentative" "oof"))
-                                 (time-less-p item-start end-time-obj)
-                                 (time-less-p start-time-obj item-end))))
-                        schedule-items)
-          (push schedule-id busy-people))))
-    busy-people))
+      (when (seq-some
+             (lambda (item)
+               (and (member (alist-get 'status item) '("busy" "tentative" "oof" "workingElsewhere"))
+                    (time-less-p (org-outlook--event-time (alist-get 'start item)) end)
+                    (time-less-p start (org-outlook--event-time (alist-get 'end item)))))
+             (append (alist-get 'scheduleItems schedule) nil))
+        (push (alist-get 'scheduleId schedule) busy)))
+    busy))
 
 (defun org-outlook-get-prop-from-agenda (prop)
-  (let* ((hdmarker (or (org-get-at-bol 'org-hd-marker)
-		      (org-agenda-error)))
-	 (buffer (marker-buffer hdmarker))
-	 (pos (marker-position hdmarker)))
-    (org-with-remote-undo buffer
-      (with-current-buffer buffer
-	(widen)
-	(goto-char pos)
-        (setq theprop (org-outlook-get-appointment-property prop))
-	)))
-  theprop)
+  "Resolve PROP through the source entry without changing point or narrowing."
+  (let ((marker (or (org-get-at-bol 'org-hd-marker)
+                    (org-get-at-bol 'org-marker))))
+    (unless (and (markerp marker) (marker-buffer marker))
+      (user-error "No live Org entry on this agenda line"))
+    (with-current-buffer (marker-buffer marker)
+      (save-restriction
+        (widen)
+        (save-excursion
+          (goto-char marker)
+          (org-outlook-get-appointment-property prop))))))
 
 (defun org-outlook-respond-to-event (method &optional comment sendresponse)
   "Send response METHOD with optional COMMENT and SENDRESPONSE.
@@ -770,14 +864,14 @@ Perform local decline cleanup only after the server accepts the response."
          (sendresponse (if (string= sendresponse "Y") t :json-false))
          (recipients (when (string= method "forward") (read-string "Forward to: ")))
          (id (or (org-outlook-get-appointment-property "OUTLOOK-ID")
-                 (org-outlook-get-prop-from-agenda "OUTLOOK-ID")))
-         (local-id (or (org-outlook-get-appointment-property "ID")
-                       (org-outlook-get-prop-from-agenda "ID")))
+                 (user-error "No active Outlook event on this entry")))
+         (local-id (org-outlook-get-appointment-property "ID"))
          (data (org-outlook--graph-data
-                'post (concat org-outlook-events-create-url "/" id "/" method)
+                'post (concat org-outlook-events-create-url "/" (url-hexify-string id) "/" method)
                 :body (remove
                        nil
-                       `(,(unless (string= method "cancel") `("sendResponse" . ,sendresponse))
+                       `(,(when (member method '("accept" "decline" "tentativelyAccept"))
+                            `("sendResponse" . ,sendresponse))
                          ,(when recipients
                             `("toRecipients" .
                               ,(vconcat
@@ -785,18 +879,23 @@ Perform local decline cleanup only after the server accepts the response."
                                           `(("emailAddress" . (("address" . ,address)))))
                                         (split-string recipients)))))
                          ,(unless (string= comment "") `("comment" . ,comment)))))))
-    (when (string= method "decline")
+    (when (member method '("decline" "cancel"))
       (org-outlook-delete-by-id local-id))
     (message "Responded to event")
     data))
 
-(defun org-outlook-agenda-goto-meeting () ; TODO Fix (if used)
+(defun org-outlook-agenda-goto-meeting ()
+  "Open the agenda at this meeting's date in the configured time zone."
   (interactive)
- (let* ((time (or (org-outlook-get-appointment-property "MEETING-TIME")
-		 (org-outlook-get-prop-from-agenda "MEETING-TIME"))))
-
-   (org-agenda nil "n")
-   (org-agenda-goto-date time)))
+  (let* ((raw (or (org-outlook-get-appointment-property "OUTLOOK-START")
+                  (let ((timestamp (org-outlook-get-appointment-property "MEETING-TIME")))
+                    (when timestamp (org-outlook-start-time-from-timestamp timestamp)))
+                  (user-error "This event has no meeting time")))
+         (time (decode-time (org-outlook--parse-time raw org-outlook-local-timezone)
+                            (org-outlook--timezone org-outlook-local-timezone)))
+         (date (list (nth 4 time) (nth 3 time) (nth 5 time))))
+    (org-agenda nil "a")
+    (org-agenda-goto-date date)))
 
 
 (defun org-outlook-accept-event ()
@@ -811,11 +910,11 @@ Perform local decline cleanup only after the server accepts the response."
   (interactive)
   (org-outlook-respond-to-event "tentativelyAccept"))
 
-(defun org-outlook-cancel-event () ;TODO Fix Json encode error
+(defun org-outlook-cancel-event ()
   (interactive)
   (org-outlook-respond-to-event "cancel"))
 
-(defun org-outlook-forward-event () ;TODO test
+(defun org-outlook-forward-event ()
   (interactive)
   (org-outlook-respond-to-event "forward"))
 
@@ -823,6 +922,7 @@ Perform local decline cleanup only after the server accepts the response."
 (defun org-outlook-add-attachment (myfile)
   "Attach MYFILE to the current event, signaling on Graph failure."
   (let* ((id (org-outlook-get-appointment-property "OUTLOOK-ID"))
+         (_valid (unless id (user-error "No active Outlook event on this entry")))
          (filename (file-name-nondirectory myfile))
          (filebytes (with-temp-buffer
                       (set-buffer-multibyte nil)
@@ -830,7 +930,7 @@ Perform local decline cleanup only after the server accepts the response."
                       (base64-encode-string (buffer-string) t))))
     (prog1
         (org-outlook--graph-data
-         'post (concat org-outlook-events-create-url "/" id "/attachments")
+         'post (concat org-outlook-events-create-url "/" (url-hexify-string id) "/attachments")
          :body `(("@odata.type" . "#microsoft.graph.fileAttachment")
                  ("name" . ,filename)
                  ("contentBytes" . ,filebytes)))
@@ -851,7 +951,9 @@ Unknown or already retired IDs are harmless."
             (goto-char (cdr location))
             (let ((remote (org-entry-get nil "OUTLOOK-ID")))
               (when (and remote (equal id (org-entry-get nil "ID"))
-                         (equal id (secure-hash 'sha256 remote)))
+                         (or (equal id (secure-hash 'sha256 remote))
+                             (let ((legacy (org-entry-get nil "OUTLOOK-LEGACY-ID")))
+                               (and legacy (equal id (secure-hash 'sha256 legacy))))))
                 (let ((edits (org-outlook--entry-edits
                               (current-buffer) (list :id remote :begin (point)) nil)))
                   (atomic-change-group
@@ -876,9 +978,9 @@ START and END fix the dates of an initial round even across midnight."
    'get (or nextlink
             (concat org-outlook-events-delta-url "?"
                     (org-outlook--build-query-string
-                     `(("startDateTime" . ,(concat (or start (org-outlook-start)) "T00:00:00.000Z"))
-                       ("endDateTime" . ,(concat (or end (org-outlook-end)) "T23:59:59.000Z"))))))
-   :headers `(("Prefer" . ,(format "outlook.timezone=\"%s\"" org-outlook-local-timezone)))))
+                     `(("startDateTime" . ,(org-outlook--utc-string (org-outlook--window-boundary (or start (org-outlook-start)))))
+                       ("endDateTime" . ,(org-outlook--utc-string (org-outlook--window-boundary (or end (org-outlook-end)) t)))))))
+   :headers '(("Prefer" . "outlook.timezone=\"UTC\""))))
 
 (defun org-outlook-last-delta ()
   (let*
@@ -930,9 +1032,9 @@ otherwise NEXTLINK or the saved cursor continues the existing view."
    'get (or nextlink
             (concat org-outlook-events-url "?"
                     (org-outlook--build-query-string
-                     `(("startDateTime" . ,(concat (org-outlook-start) "T00:00:00.000Z"))
-                       ("endDateTime" . ,(concat (org-outlook-end) "T23:59:59.000Z"))))))
-   :headers `(("Prefer" . ,(format "outlook.timezone=\"%s\"" org-outlook-local-timezone)))))
+                     `(("startDateTime" . ,(org-outlook--utc-string (org-outlook--window-boundary (org-outlook-start))))
+                       ("endDateTime" . ,(org-outlook--utc-string (org-outlook--window-boundary (org-outlook-end) t)))))))
+   :headers '(("Prefer" . "outlook.timezone=\"UTC\""))))
 
 (defun org-outlook-retrieve-pages (&optional nextlink)
   "Return every calendar event, requesting complete continuation URLs."
@@ -979,6 +1081,9 @@ FULL also records full-sync completion in the same cache write."
      "delta" (list :delta (org-outlook-sync-batch-delta batch)
                    :start (org-outlook-sync-batch-start batch)
                    :end (org-outlook-sync-batch-end batch)
+                   :timezone org-outlook-local-timezone
+                   :id-type "immutable"
+                   :tenant org-outlook-tenant-id :client org-outlook-client-id
                    :full-sync full-time)
      nil)))
 
@@ -993,32 +1098,29 @@ FULL also records full-sync completion in the same cache write."
                        files))))))
 
 (defun org-outlook--entry-in-window-p (start end)
-  "At a headline, test its active timestamp against dates START and END.
-Missing timestamps do not authorize pruning.  Only the headline's own
-section is inspected, so timestamps in child headings do not qualify it."
+  "Test this entry's server instants, or its legacy timestamp, against the window."
   (save-excursion
-    (let ((limit (save-excursion (outline-next-heading) (point))))
-      (forward-line 1)
-      (when (re-search-forward org-ts-regexp limit t)
-        (let* ((value (match-string-no-properties 0))
-               (parts (and value (cadr (org-timestamp-from-string value))))
-               (from (and parts
-                          (encode-time 0 (or (plist-get parts :minute-start) 0)
-                                       (or (plist-get parts :hour-start) 0)
-                                       (plist-get parts :day-start)
-                                       (plist-get parts :month-start)
-                                       (plist-get parts :year-start)
-                                       org-outlook-local-timezone)))
-               (to (and parts
-                        (encode-time 0 (or (plist-get parts :minute-end) 0)
-                                     (or (plist-get parts :hour-end) 0)
-                                     (plist-get parts :day-end)
-                                     (plist-get parts :month-end)
-                                     (plist-get parts :year-end)
-                                     org-outlook-local-timezone))))
-          (and from to
-               (not (time-less-p to (parse-iso8601-time-string (concat start "T00:00:00Z"))))
-               (not (time-less-p (parse-iso8601-time-string (concat end "T23:59:59Z")) from))))))))
+    (let* ((from (org-entry-get nil "OUTLOOK-START"))
+           (to (org-entry-get nil "OUTLOOK-END"))
+           (times (if (and from to)
+                      (cons (org-outlook--parse-time from org-outlook-local-timezone)
+                            (org-outlook--parse-time to org-outlook-local-timezone))
+                    (let ((limit (save-excursion (outline-next-heading) (point))))
+                      (forward-line 1)
+                      (when (re-search-forward org-ts-regexp limit t)
+                        (let* ((parts (cadr (org-timestamp-from-string (match-string-no-properties 0))))
+                               (make (lambda (suffix)
+                                       (encode-time
+                                        0 (or (plist-get parts (intern (concat ":minute-" suffix))) 0)
+                                        (or (plist-get parts (intern (concat ":hour-" suffix))) 0)
+                                        (plist-get parts (intern (concat ":day-" suffix)))
+                                        (plist-get parts (intern (concat ":month-" suffix)))
+                                        (plist-get parts (intern (concat ":year-" suffix)))
+                                        (org-outlook--timezone org-outlook-local-timezone)))))
+                          (cons (funcall make "start") (funcall make "end"))))))))
+      (and times
+           (time-less-p (car times) (org-outlook--window-boundary end t))
+           (time-less-p (org-outlook--window-boundary start) (cdr times))))))
 
 (defun org-outlook--managed-child (id)
   "Return the bounds of the direct generated child for remote ID.
@@ -1071,8 +1173,13 @@ Legacy body text is retained in a commented child on first migration."
                   (goto-char (point-min))
                   (org-entry-put nil "OUTLOOK-SYNC-VERSION" "1")
                   (if event
-                      (progn
+                      (let ((local-id (org-entry-get nil "ID"))
+                            (legacy (or (org-entry-get nil "OUTLOOK-LEGACY-ID") id)))
                         (org-outlook--put-properties (org-outlook--event-properties event))
+                        (when local-id
+                          (org-entry-put nil "ID" local-id)
+                          (unless (equal local-id (secure-hash 'sha256 (alist-get 'id event)))
+                            (org-entry-put nil "OUTLOOK-LEGACY-ID" legacy)))
                         (org-entry-delete nil "OUTLOOK-RETIRED-ID")
                         (org-entry-delete nil "OUTLOOK-DELETED"))
                     (org-entry-put nil "OUTLOOK-RETIRED-ID" id)
@@ -1100,20 +1207,55 @@ Legacy body text is retained in a commented child on first migration."
              (let ((remote (or (org-entry-get nil "OUTLOOK-ID")
                                (org-entry-get nil "OUTLOOK-RETIRED-ID")))
                    (id (org-entry-get nil "ID")))
-               (when (and remote id (equal id (secure-hash 'sha256 remote)))
+               (when (and remote id
+                          (or (equal id (secure-hash 'sha256 remote))
+                              (let ((legacy (org-entry-get nil "OUTLOOK-LEGACY-ID")))
+                                (and legacy (equal id (secure-hash 'sha256 legacy))))))
                  (push (list :id remote :begin (point)
                              :end (save-excursion (org-end-of-subtree t t) (point))
                              :change (org-entry-get nil "CHANGEKEY")
+                             :timezone (org-entry-get nil "OUTLOOK-TIMEZONE")
+                             :id-type (org-entry-get nil "OUTLOOK-ID-TYPE")
                              :version (org-entry-get nil "OUTLOOK-SYNC-VERSION")
                              :child (org-outlook--managed-child remote)
                              :deleted (org-entry-get nil "OUTLOOK-DELETED")
-                             :in-window (save-excursion
+                             :in-window (if (and (org-entry-get nil "OUTLOOK-START")
+                                                 (org-entry-get nil "OUTLOOK-END"))
+                                            (org-outlook--entry-in-window-p start end)
+                                          (save-excursion
                                           (let ((child (org-outlook--managed-child remote)))
                                             (when child (goto-char (car child)))
-                                            (org-outlook--entry-in-window-p start end))))
+                                            (org-outlook--entry-in-window-p start end)))))
                        entries))))
            nil nil)
           entries)))))
+
+(defun org-outlook--legacy-id-map (start end)
+  "Translate existing mutable IDs before associating a new immutable snapshot.
+Do not change files if translation is denied or incomplete.  Keep old Org
+IDs so existing links survive.  Translation requires delegated User.Read."
+  (let (ids (mapping (make-hash-table :test #'equal)))
+    (dolist (file (org-outlook--sync-files))
+      (when (file-exists-p file)
+        (let ((buffer (find-file-noselect file)))
+          (dolist (entry (org-outlook--managed-entries buffer start end))
+            (unless (equal "immutable" (plist-get entry :id-type))
+              (push (plist-get entry :id) ids))))))
+    (setq ids (delete-dups ids))
+    (while ids
+      (let* ((batch (seq-take ids 1000))
+             (data (org-outlook--graph-data
+                    'post "https://graph.microsoft.com/v1.0/me/translateExchangeIds"
+                    :body `(("inputIds" . ,(vconcat batch))
+                            ("sourceIdType" . "restId") ("targetIdType" . "restImmutableEntryId")))))
+        (dolist (item (org-outlook--graph-page-events data))
+          (let ((source (alist-get 'sourceId item)) (target (alist-get 'targetId item)))
+            (when (and (member source batch) (stringp target) (not (string-empty-p target)))
+              (puthash source target mapping))))
+        (unless (seq-every-p (lambda (id) (gethash id mapping)) batch)
+          (signal 'org-outlook-graph-error '("Incomplete event ID migration; local notes were not changed")))
+        (setq ids (nthcdr (length batch) ids))))
+    mapping))
 
 (defun org-outlook--apply-sync-batch (batch full)
   "Apply BATCH and reconcile missing IDs when FULL is non-nil.
@@ -1126,13 +1268,14 @@ be retried safely from the previous cursor."
         (locals (make-hash-table :test #'equal))
         (start (org-outlook-sync-batch-start batch))
         (end (org-outlook-sync-batch-end batch))
-        edits buffers groups saved accepted)
+        edits buffers groups saved accepted migrations)
     ;; Delta rounds can mention an ID more than once; the final version wins.
     (dolist (event (org-outlook-sync-batch-events batch))
       (let ((id (alist-get 'id event)))
         (unless (and (stringp id) (not (string-empty-p id)))
           (signal 'org-outlook-graph-error '("Event has no valid Graph ID")))
         (puthash id event events)))
+    (setq migrations (org-outlook--legacy-id-map start end))
     (dolist (file (org-outlook--sync-files))
       (when (or (equal file (expand-file-name org-outlook-file)) (file-exists-p file))
         (let ((buffer (find-file-noselect file)))
@@ -1140,20 +1283,23 @@ be retried safely from the previous cursor."
             (unless (derived-mode-p 'org-mode) (org-mode)))
           (dolist (entry (org-outlook--managed-entries buffer start end))
             (let* ((id (plist-get entry :id))
-                   (event (gethash id events))
+                   (canonical (or (gethash id migrations) id))
+                   (event (gethash canonical events))
                    (remove (and (not (plist-get entry :deleted))
                                 (plist-get entry :in-window)
                                 (or (alist-get '@removed event)
                                     (and full (not event))))))
-              (when (gethash id locals)
+              (when (gethash canonical locals)
                 (error "Duplicate managed Outlook ID in local files: %s" id))
-              (puthash id (cons buffer entry) locals)
+              (puthash canonical (cons buffer entry) locals)
               (cond
                (remove
                 (setq edits (append (org-outlook--entry-edits buffer entry nil) edits)))
                ((and event (not (alist-get '@removed event))
                      (or (not (plist-get entry :version))
+                         (gethash id migrations)
                          (not (plist-get entry :child))
+                         (not (equal org-outlook-local-timezone (plist-get entry :timezone)))
                          (plist-get entry :deleted)
                          (not (equal (alist-get 'changeKey event) (plist-get entry :change)))))
                 (setq edits (append (org-outlook--entry-edits buffer entry event) edits)))))))))
@@ -1265,6 +1411,10 @@ Other fetch or local errors propagate without advancing the saved cursor."
   (let* ((state (org-outlook--sync-state))
          (last-full (org-outlook-last-full-sync-time))
          (full (or force-full (not (plist-get state :delta))
+                   (not (equal (plist-get state :tenant) org-outlook-tenant-id))
+                   (not (equal (plist-get state :client) org-outlook-client-id))
+                   (not (equal (plist-get state :timezone) org-outlook-local-timezone))
+                   (not (equal (plist-get state :id-type) "immutable"))
                    (not (equal (plist-get state :start) (org-outlook-start)))
                    (not (equal (plist-get state :end) (org-outlook-end)))
                    (and org-outlook-full-sync-interval-days last-full
@@ -1290,15 +1440,16 @@ AVAILABILITY-INTERVAL defaults to 30 minutes.  Signal on Graph failure."
    (list (split-string (read-string "Email addresses (space separated): "))
          (read-string "Start time (YYYY-MM-DDTHH:MM:SS): ")
          (read-string "End time (YYYY-MM-DDTHH:MM:SS): ")))
-  (org-outlook--graph-data
+  (let ((start (org-outlook--parse-time start-time org-outlook-local-timezone t))
+        (end (org-outlook--parse-time end-time org-outlook-local-timezone t)))
+    (unless (time-less-p start end) (user-error "Availability end must be after its start"))
+    (org-outlook--graph-data
    'post org-outlook-schedule-url
    :body `(("schedules" . ,(vconcat schedules))
-           ("startTime" . (("dateTime" . ,start-time)
-                           ("timeZone" . ,org-outlook-local-timezone)))
-           ("endTime" . (("dateTime" . ,end-time)
-                         ("timeZone" . ,org-outlook-local-timezone)))
+           ("startTime" . (("dateTime" . ,(org-outlook--utc-string start)) ("timeZone" . "UTC")))
+           ("endTime" . (("dateTime" . ,(org-outlook--utc-string end)) ("timeZone" . "UTC")))
            ("availabilityViewInterval" . ,(or availability-interval 30)))
-   :headers `(("Prefer" . ,(format "outlook.timezone=\"%s\"" org-outlook-local-timezone)))))
+   :headers '(("Prefer" . "outlook.timezone=\"UTC\"")))))
 
 (defun org-outlook-display-availability (data)
   "Display availability data in a readable format."
@@ -1323,10 +1474,10 @@ AVAILABILITY-INTERVAL defaults to 30 minutes.  Signal on Graph failure."
                 (dolist (item schedule-items)
                   (let ((status (assoc-default 'status item))
                         (subject (assoc-default 'subject item))
-                        (start (assoc-default 'dateTime (assoc-default 'start item)))
-                        (end (assoc-default 'dateTime (assoc-default 'end item)))
+                        (start (assoc-default 'start item))
+                        (end (assoc-default 'end item))
                         (location (assoc-default 'location item))
-                        (is-private (assoc-default 'isPrivate item)))
+                        (is-private (eq t (assoc-default 'isPrivate item))))
                     (insert (format "  • %s: %s\n"
                                   (upcase status)
                                   (if (and subject (not is-private)) subject "Private/No Subject")))
@@ -1352,37 +1503,31 @@ AVAILABILITY-INTERVAL defaults to 30 minutes.  Signal on Graph failure."
       (goto-char (point-min))
       (display-buffer (current-buffer)))))
 
-(defun org-outlook-format-datetime (datetime-str)
-  "Format datetime string for display using existing time parsing."
-  (let ((time-obj (parse-iso8601-time-string datetime-str)))
-    (format-time-string "%Y-%m-%d %H:%M" time-obj)))
+(defun org-outlook-format-datetime (datetime)
+  "Display Graph DATETIME (string or dateTimeTimeZone) in the configured zone."
+  (format-time-string "%Y-%m-%d %H:%M"
+                      (if (stringp datetime) (org-outlook--parse-time datetime "UTC")
+                        (org-outlook--event-time datetime))
+                      (org-outlook--timezone org-outlook-local-timezone)))
 
 (defun org-outlook-persons-available-p (emails start-time end-time)
-  "Check if EMAILS are available between START-TIME and END-TIME.
-EMAILS can be a single email string or a list of email strings.
-Returns t if ALL are available (free), nil if ANY are busy.
-START-TIME and END-TIME should be in format \"2019-03-15T09:00:00\"."
-  (let* ((email-list (if (listp emails) emails (list emails)))
-         (data (org-outlook-check-availability email-list start-time end-time))
-         (schedules (append (assoc-default 'value data) nil))
-         (start-time-obj (parse-iso8601-time-string start-time))
-         (end-time-obj (parse-iso8601-time-string end-time)))
-    ;; Check if ALL persons are available
-    (seq-every-p (lambda (person-schedule)
-                   (let ((schedule-items (append (assoc-default 'scheduleItems person-schedule) nil)))
-                     ;; Person is available if no busy/tentative items overlap
-                     (not (seq-some (lambda (item)
-                                      (let ((item-start (parse-iso8601-time-string
-                                                        (assoc-default 'dateTime (assoc-default 'start item))))
-                                            (item-end (parse-iso8601-time-string
-                                                      (assoc-default 'dateTime (assoc-default 'end item))))
-                                            (status (assoc-default 'status item)))
-                                        ;; Check if item is busy/tentative and overlaps with our time slot
-                                        (and (member status '("busy" "tentative" "oof"))
-                                             (time-less-p item-start end-time-obj)
-                                             (time-less-p start-time-obj item-end))))
-                                    schedule-items))))
-                 schedules)))
+  "Return t only when every requested EMAILS schedule is known and free.
+Unknown, missing, or failed schedules signal instead of implying availability."
+  (let* ((emails (if (listp emails) emails (list emails)))
+         (data (org-outlook-check-availability emails start-time end-time))
+         (schedules (append (alist-get 'value data) nil)))
+    (unless (and emails (= (length emails) (length schedules))
+                 (seq-every-p
+                  (lambda (email)
+                    (= 1 (cl-count email schedules :key (lambda (s) (alist-get 'scheduleId s))
+                                   :test (lambda (a b) (equal (downcase a) (downcase (or b "")))))))
+                  emails)
+                 (seq-every-p (lambda (s) (and (not (alist-get 'error s))
+                                               (assq 'scheduleItems s)
+                                               (vectorp (alist-get 'scheduleItems s))))
+                              schedules))
+      (signal 'org-outlook-graph-error '("Availability is unknown for one or more attendees")))
+    (not (org-outlook-get-busy-attendees schedules start-time end-time))))
 
 (defun org-outlook-i-am-available-p (start-time end-time)
   "Check if you are available between START-TIME and END-TIME.
