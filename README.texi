@@ -195,7 +195,7 @@ applications. In this case, unfortunately, you won't be able to use @samp{org-ou
 @item
 @uref{https://github.com/jeremy-compostella/org-msg, org-msg}  
 @item
-@uref{https://github.com/tkf/emacs-request/tree/master, emacs-request}  
+@uref{https://github.com/alphapapa/plz.el, plz} 0.10-pre or newer (HTTP requests via curl; PATCH body support is required)
 @item
 @uref{https://github.com/hniksic/emacs-htmlize, htmlize}
 @item

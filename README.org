@@ -63,7 +63,7 @@ applications. In this case, unfortunately, you won't be able to use =org-outlook
  - [[http://github.com/lujun9972/html2org.el][html2org]]
  - [[https://github.com/ndwarshuis/org-ml][org-ml]]
  - [[https://github.com/jeremy-compostella/org-msg][org-msg]]
- - [[https://github.com/alphapapa/plz.el][plz]] (HTTP requests via curl)
+ - [[https://github.com/alphapapa/plz.el][plz]] 0.10-pre or newer (HTTP requests via curl; PATCH body support is required)
  - [[https://github.com/hniksic/emacs-htmlize][htmlize]]
  - [[https://github.com/eschulte/emacs-web-server][emacs-web-server]] (if you experience a conflict, see: [[#known-issues][Known issues]])
 
@@ -205,6 +205,13 @@ Installing with [[https://framagit.org/steckerhalter/quelpa][Quelpa]] is easy:
 
 ** Tips
 
++ *Graph request failures:* Calendar, Teams, and availability calls use a shared
+  synchronous transport. A 401 response refreshes credentials and retries once.
+  Other errors stop the operation and report their HTTP status; throttling errors
+  include the server's =Retry-After= value when supplied. Failed writes are not
+  automatically replayed after network errors or server failures, since the server
+  may already have applied them.
+
 + Calling =org-outlook-sync= via =emacs --batch= avoids blocking your main emacs session.
 
 + *Creating meetings with org-capture workflow:*
@@ -232,6 +239,24 @@ Installing with [[https://framagit.org/steckerhalter/quelpa][Quelpa]] is easy:
 :END:
 
 /Note:/ Breaking changes may be made before version 1.0, but in the event of major changes, attempts at backward compatibility will be made with obsolescence declarations, translation of arguments, etc.  Users who need stability guarantees before 1.0 may choose to use tagged stable releases.
+
+** Unreleased
+
++ All Graph calls now use =plz=; =request.el= is no longer required.
++ Requires =plz= 0.10-pre or newer so calendar PATCH requests include their bodies.
+  Install the upstream development version if your package archive provides an
+  older release.
++ Full and delta sync follow complete continuation URLs, validate collection
+  responses, and propagate HTTP failures instead of treating them as empty pages.
++ The transport returns =org-outlook-graph-result= structures. Package commands
+  signal =org-outlook-graph-error= on failure; its condition data includes the result.
++ Graph regression tests are in =test/org-outlook-graph-test.el=. With package
+  dependencies installed, run:
+
+  #+BEGIN_SRC sh
+  emacs --batch --eval "(package-initialize)" -L . \
+    -l test/org-outlook-graph-test.el -f ert-run-tests-batch-and-exit
+  #+END_SRC
 
 ** 0.1.4-beta (2026-04-21)
 
