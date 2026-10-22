@@ -562,6 +562,7 @@ transaction ID so a manual retry after an uncertain response is deduplicated."
       ;; Retain identity before any further processing can fail.
       (org-entry-put nil "OUTLOOK-ID" remote-id)
       (org-entry-put nil "ID" (or local-id (secure-hash 'sha256 remote-id)))
+      (org-entry-put nil "OUTLOOK-LOCAL-ID" (org-entry-get nil "ID"))
       (when (and id local-id (not (equal local-id (secure-hash 'sha256 remote-id))))
         (org-entry-put nil "OUTLOOK-LEGACY-ID" (or (org-entry-get nil "OUTLOOK-LEGACY-ID") id)))
       (org-entry-put nil "OUTLOOK-SYNC-VERSION" "1")
@@ -940,6 +941,20 @@ Perform local decline cleanup only after the server accepts the response."
 (add-hook 'org-capture-prepare-finalize-hook #'org-outlook-finalize-capture)
 (setq org-outlook-events-delta-url "https://graph.microsoft.com/v1.0/me/calendarview/delta")
 
+(defun org-outlook--managed-id-p (id remote)
+  "Return non-nil when this entry records ownership of ID and REMOTE.
+Created meetings record their local Org ID explicitly, since it may be
+an existing UUID.  Older captures can be recognized by their transaction
+and marked generated child.  Imported and legacy entries support hashed IDs."
+  (and id remote
+       (or (equal id (org-entry-get nil "OUTLOOK-LOCAL-ID"))
+           (equal id (secure-hash 'sha256 remote))
+           (let ((legacy (org-entry-get nil "OUTLOOK-LEGACY-ID")))
+             (and legacy (equal id (secure-hash 'sha256 legacy))))
+           (and (equal "1" (org-entry-get nil "OUTLOOK-SYNC-VERSION"))
+                (org-entry-get nil "OUTLOOK-TRANSACTION-ID")
+                (org-outlook--managed-child remote)))))
+
 (defun org-outlook-delete-by-id (id)
   "Retire the managed event ID while retaining its personal Org content.
 Unknown or already retired IDs are harmless."
@@ -951,10 +966,8 @@ Unknown or already retired IDs are harmless."
           (save-excursion
             (goto-char (cdr location))
             (let ((remote (org-entry-get nil "OUTLOOK-ID")))
-              (when (and remote (equal id (org-entry-get nil "ID"))
-                         (or (equal id (secure-hash 'sha256 remote))
-                             (let ((legacy (org-entry-get nil "OUTLOOK-LEGACY-ID")))
-                               (and legacy (equal id (secure-hash 'sha256 legacy))))))
+              (when (and (equal id (org-entry-get nil "ID"))
+                         (org-outlook--managed-id-p id remote))
                 (let ((edits (org-outlook--entry-edits
                               (current-buffer) (list :id remote :begin (point)) nil)))
                   (atomic-change-group
@@ -1173,6 +1186,8 @@ Legacy body text is retained in a commented child on first migration."
                         (unless (bolp) (insert "\n")))))
                   (goto-char (point-min))
                   (org-entry-put nil "OUTLOOK-SYNC-VERSION" "1")
+                  (let ((local-id (org-entry-get nil "ID")))
+                    (when local-id (org-entry-put nil "OUTLOOK-LOCAL-ID" local-id)))
                   (if event
                       (let ((local-id (org-entry-get nil "ID"))
                             (legacy (or (org-entry-get nil "OUTLOOK-LEGACY-ID") id)))
@@ -1208,10 +1223,7 @@ Legacy body text is retained in a commented child on first migration."
              (let ((remote (or (org-entry-get nil "OUTLOOK-ID")
                                (org-entry-get nil "OUTLOOK-RETIRED-ID")))
                    (id (org-entry-get nil "ID")))
-               (when (and remote id
-                          (or (equal id (secure-hash 'sha256 remote))
-                              (let ((legacy (org-entry-get nil "OUTLOOK-LEGACY-ID")))
-                                (and legacy (equal id (secure-hash 'sha256 legacy))))))
+               (when (org-outlook--managed-id-p id remote)
                  (push (list :id remote :begin (point)
                              :end (save-excursion (org-end-of-subtree t t) (point))
                              :change (org-entry-get nil "CHANGEKEY")

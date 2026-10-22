@@ -152,6 +152,86 @@
             '((joinUrl . "https://teams.microsoft.com/l/meetup-join/server-link"))))
     (org-outlook-test-response 201 (json-encode event))))
 
+(defun org-outlook-test-create-with-local-id (file local-id)
+  "Create a mocked calendar event in FILE while preserving LOCAL-ID."
+  (let ((text
+         (org-outlook-test-with-capture-entry "no"
+           (org-entry-put nil "ID" local-id)
+           (org-outlook-test-with-responses (list (org-outlook-test-calendar-response))
+             (org-outlook-calendar-create-or-update-event))
+           (buffer-string))))
+    (with-current-buffer (find-file-noselect file)
+      (goto-char (point-max))
+      (let ((begin (point)))
+        (insert text)
+        (save-buffer)
+        begin))))
+
+(ert-deftest org-outlook-capture-existing-org-id-syncs-without-duplicates ()
+  (org-outlook-test-with-native-files
+    (let* ((local-id "7b82d734-88de-491b-acfe-8fc6d675e3b4")
+           (begin (org-outlook-test-create-with-local-id refiled local-id))
+           (event (org-outlook-test-event "created-event" "updated")))
+      (setf (alist-get 'body event)
+            '((contentType . "text") (content . "Updated remote description")))
+      (dolist (full '(nil t))
+        (org-outlook--apply-sync-batch (org-outlook-test-batch (list event)) full)
+        (with-current-buffer (get-file-buffer refiled)
+          (goto-char begin)
+          (should (equal local-id (org-entry-get nil "ID")))
+          (should (equal "updated" (org-entry-get nil "CHANGEKEY")))
+          (should (= 1 (length (org-outlook--managed-entries
+                               (current-buffer) "2026-10-01" "2026-12-31")))))
+        (let ((text (org-outlook-test-file-text refiled)))
+          (should (string-match-p "Meeting agenda" text))
+          (should (string-match-p "Updated remote description" text)))
+        (should-not (string-match-p ":OUTLOOK-ID: created-event"
+                                    (org-outlook-test-file-text org-outlook-file)))))))
+
+(ert-deftest org-outlook-capture-existing-org-id-without-marker-recovers ()
+  (org-outlook-test-with-native-files
+    (let* ((local-id "7b82d734-88de-491b-acfe-8fc6d675e3b4")
+           (begin (org-outlook-test-create-with-local-id refiled local-id)))
+      ;; Simulate a capture saved before local IDs were recorded explicitly.
+      (with-current-buffer (get-file-buffer refiled)
+        (goto-char begin)
+        (org-entry-delete nil "OUTLOOK-LOCAL-ID")
+        (save-buffer))
+      (org-outlook--apply-sync-batch (org-outlook-test-batch nil) t)
+      (with-current-buffer (get-file-buffer refiled)
+        (goto-char begin)
+        (should (equal local-id (org-entry-get nil "ID")))
+        (should (equal local-id (org-entry-get nil "OUTLOOK-LOCAL-ID")))
+        (should (equal "created-event" (org-entry-get nil "OUTLOOK-RETIRED-ID")))
+        (should (= 1 (length (org-outlook--managed-entries
+                             (current-buffer) "2026-10-01" "2026-12-31")))))
+      (should (string-match-p "Meeting agenda" (org-outlook-test-file-text refiled))))))
+
+(ert-deftest org-outlook-capture-existing-org-id-retires-and-resurrects ()
+  (org-outlook-test-with-native-files
+    (let* ((local-id "7b82d734-88de-491b-acfe-8fc6d675e3b4")
+           (begin (org-outlook-test-create-with-local-id refiled local-id)))
+      (cl-letf (((symbol-function 'org-id-find)
+                 (lambda (id)
+                   (should (equal local-id id))
+                   (cons refiled begin))))
+        (org-outlook-delete-by-id local-id))
+      (with-current-buffer (get-file-buffer refiled)
+        (goto-char begin)
+        (should-not (org-entry-get nil "OUTLOOK-ID"))
+        (should (equal "created-event" (org-entry-get nil "OUTLOOK-RETIRED-ID")))
+        (should (equal local-id (org-entry-get nil "ID"))))
+      (org-outlook--apply-sync-batch
+       (org-outlook-test-batch (list (org-outlook-test-event "created-event"))) nil)
+      (with-current-buffer (get-file-buffer refiled)
+        (goto-char begin)
+        (should (equal local-id (org-entry-get nil "ID")))
+        (should (equal "created-event" (org-entry-get nil "OUTLOOK-ID")))
+        (should-not (org-entry-get nil "OUTLOOK-RETIRED-ID")))
+      (should (string-match-p "Meeting agenda" (org-outlook-test-file-text refiled)))
+      (should-not (string-match-p ":OUTLOOK-ID: created-event"
+                                  (org-outlook-test-file-text org-outlook-file))))))
+
 (ert-deftest org-outlook-capture-teams-uses-one-calendar-post-and-returned-url ()
   (org-outlook-test-with-capture-entry "yes"
     (org-outlook-test-with-responses (list (org-outlook-test-calendar-response t))
