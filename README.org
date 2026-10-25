@@ -66,7 +66,6 @@ applications. In this case, unfortunately, you won't be able to use =org-outlook
  - [[https://github.com/jeremy-compostella/org-msg][org-msg]]
  - [[https://github.com/alphapapa/plz.el][plz]] 0.10-pre or newer (HTTP requests via curl; PATCH body support is required)
  - [[https://github.com/hniksic/emacs-htmlize][htmlize]]
- - [[https://github.com/eschulte/emacs-web-server][emacs-web-server]] (if you experience a conflict, see: [[#known-issues][Known issues]])
 
 ** Optional
  
@@ -99,7 +98,39 @@ the redirect uri. At the bottom of the page ensure =Allow public client flows= i
 "Yes". From the "Overview" tab copy the =Application (client) id= and insert into your
 config as specified below.
 
-  
+** Doom Emacs
+
+Install this fork from =~/.config/doom/packages.el=:
+
+#+BEGIN_SRC elisp
+(package! org-outlook
+  :recipe (:host github :repo "amain-garrettm/org-outlook"))
+#+END_SRC
+
+Then configure it from =~/.config/doom/config.el=.  Commands are autoloaded,
+so loading can remain deferred until the first command is used.
+
+#+BEGIN_SRC elisp
+(use-package! org-outlook
+  :commands (org-outlook-sync
+             org-outlook-full-sync
+             org-outlook-join-teams-call)
+  :init
+  (setq org-outlook-gpg-recipient "you@example.com"
+        org-outlook-local-timezone "America/Chicago"
+        org-outlook-file (expand-file-name "outlook.org" org-directory))
+  :config
+  ;; Optional capture integration:
+  ;; (org-outlook-install-capture-template)
+  )
+#+END_SRC
+
+Run =doom sync= and restart Emacs after changing =packages.el=.  This fork no
+longer depends on =web-server=, so it can coexist with =simple-httpd= without
+the conflicting straight repository checkout described in the original issue.
+Neither =html2org= nor =org-msg= is loaded until the corresponding conversion
+or event-creation feature is used.
+
 ** Quelpa
 
 The package =org-outlook= is not currently available from [[https://melpa.org/#/org-ql][MELPA]], but can be installed
@@ -138,6 +169,10 @@ Installing with [[https://framagit.org/steckerhalter/quelpa][Quelpa]] is easy:
 
   ;; Optional: Set your email for availability checking functions
   (setq org-outlook-user-email "your.email@company.com")
+
+  ;; Optional: Install the org-capture workflow explicitly
+  (setq org-outlook-capture-key "o")
+  (org-outlook-install-capture-template)
   )
 #+END_SRC
 
@@ -304,6 +339,10 @@ Installing with [[https://framagit.org/steckerhalter/quelpa][Quelpa]] is easy:
 + Calling =org-outlook-sync= via =emacs --batch= avoids blocking your main emacs session.
 
 + *Creating meetings with org-capture workflow:*
+  First call =org-outlook-install-capture-template= from your configuration.
+  The command refuses to replace an unrelated template already using
+  =org-outlook-capture-key=.
+
   1. Press =C-c c o= to start the capture template
   2. Enter event title when prompted
   3. Fill in the template:
@@ -380,7 +419,7 @@ Installing with [[https://framagit.org/steckerhalter/quelpa][Quelpa]] is easy:
 + *Token exchange failure:* Fixed OAuth token exchange silently failing due to =request.el= returning nil responses in certain contexts
 + *Calendar sync returning 0 events:* Fixed =Prefer= header with timezone being malformed when passed through curl config, causing HTTP 500 from Microsoft Graph
 + *Missing token refresh on 401:* Added automatic token refresh and retry when API calls receive 401 Unauthorized
-+ *Stale token not detected:* =token-timed-out= now correctly triggers refresh when token timestamp is missing
++ *Stale token not detected:* =org-outlook-token-expired-p= now correctly triggers refresh when token timestamp is missing
 + *code_verifier sent on refresh grants:* PKCE =code_verifier= is no longer sent with =refresh_token= grant type, which could cause token exchange rejection
 
 *** Breaking Changes
@@ -493,9 +532,7 @@ Initial release
 
  - Accepting an event doesn't change the event status from =REQUEST= to =MEETING= until the
    next sync.
- - This package depends on [[https://github.com/eschulte/emacs-web-server][emacs-web-server]] which conflicts with
-   [[https://github.com/skeeto/emacs-web-server][skeeto/emacs-web-server]]. A workaround is mentioned in [[https://github.com/ifitzpat/org-outlook/issues/10][#10]].
-   
+
 ** Fixed in 0.1.2-beta
 
  - ✅ fix refresh token time-out (fixed in 0.1.2)

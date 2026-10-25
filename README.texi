@@ -47,6 +47,7 @@ Installation
 * Prerequisites::
 * Dependencies::
 * Optional::
+* Doom Emacs::
 * Quelpa::
 
 Usage
@@ -198,8 +199,6 @@ applications. In this case, unfortunately, you won't be able to use @samp{org-ou
 @uref{https://github.com/alphapapa/plz.el, plz} 0.10-pre or newer (HTTP requests via curl; PATCH body support is required)
 @item
 @uref{https://github.com/hniksic/emacs-htmlize, htmlize}
-@item
-@uref{https://github.com/eschulte/emacs-web-server, emacs-web-server} (if you experience a conflict, see: @ref{Known issues})
 @end itemize
 
 @node Optional
@@ -233,6 +232,40 @@ Under "Authentication" click @samp{Add a platform} and add @samp{http://localhos
 the redirect uri. At the bottom of the page ensure @samp{Allow public client flows} is toggled to
 "Yes". From the "Overview" tab copy the @samp{Application (client) id} and insert into your
 config as specified below.
+
+@node Doom Emacs
+@section Doom Emacs
+
+Install this fork from @file{~/.config/doom/packages.el}:
+
+@lisp
+(package! org-outlook
+  :recipe (:host github :repo "amain-garrettm/org-outlook"))
+@end lisp
+
+Then configure it from @file{~/.config/doom/config.el}.  Commands are
+autoloaded, so loading can remain deferred until the first command is used.
+
+@lisp
+(use-package! org-outlook
+  :commands (org-outlook-sync
+             org-outlook-full-sync
+             org-outlook-join-teams-call)
+  :init
+  (setq org-outlook-gpg-recipient "you@@example.com"
+        org-outlook-local-timezone "America/Chicago"
+        org-outlook-file (expand-file-name "outlook.org" org-directory))
+  :config
+  ;; Optional capture integration:
+  ;; (org-outlook-install-capture-template)
+  )
+@end lisp
+
+Run @samp{doom sync} and restart Emacs after changing @file{packages.el}.
+This fork no longer depends on @samp{web-server}, so it can coexist with
+@samp{simple-httpd} without a conflicting straight repository checkout.
+Neither @samp{html2org} nor @samp{org-msg} is loaded until the corresponding
+conversion or event-creation feature is used.
 
 @node Quelpa
 @section Quelpa
@@ -277,6 +310,10 @@ Add this form to your init file:
 
   ;; Optional: Set your email for availability checking functions
   (setq org-outlook-user-email "your.email@@company.com")
+
+  ;; Optional: Install the org-capture workflow explicitly
+  (setq org-outlook-capture-key "o")
+  (org-outlook-install-capture-template)
   )
 @end lisp
 
@@ -456,6 +493,10 @@ Calling @samp{org-outlook-sync} via @samp{emacs --batch} avoids blocking your ma
 
 @item
 @strong{Creating meetings with org-capture workflow:}
+First call @samp{org-outlook-install-capture-template} from your configuration.
+The command refuses to replace an unrelated template already using
+@samp{org-outlook-capture-key}.
+
 @enumerate
 @item
 Press @samp{C-c c o} to start the capture template
@@ -755,9 +796,6 @@ Initial release
 @item
 Accepting an event doesn't change the event status from @samp{REQUEST} to @samp{MEETING} until the
 next sync.
-@item
-This package depends on @uref{https://github.com/eschulte/emacs-web-server, emacs-web-server} which conflicts with
-@uref{https://github.com/skeeto/emacs-web-server, skeeto/emacs-web-server}. A workaround is mentioned in #10.
 @end itemize
 
 @node Fixed in 012-beta

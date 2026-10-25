@@ -4,6 +4,7 @@
        (root (file-name-directory (directory-file-name tests))))
   (add-to-list 'load-path root)
   (add-to-list 'load-path tests))
+(require 'org-outlook-load-test)
 (require 'org-outlook-auth-test)
 (require 'org-outlook-time-workflow-test)
 (ert-run-tests-batch-and-exit)

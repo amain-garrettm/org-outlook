@@ -120,6 +120,40 @@ Stub event rendering and ID persistence, but use real Org buffers and saves."
               (set-buffer-modified-p nil)
               (kill-buffer))))))))
 
+(ert-deftest org-outlook-sync-parses-each-managed-file-once ()
+  (org-outlook-test-with-files
+    (org-outlook-test-append-entry org-outlook-file "destination")
+    (org-outlook-test-append-entry refiled "refiled")
+    (let ((original (symbol-function 'org-outlook--managed-entries))
+          (counts (make-hash-table :test #'equal)))
+      (cl-letf (((symbol-function 'org-outlook--managed-entries)
+                 (lambda (buffer start end)
+                   (cl-incf (gethash (buffer-file-name buffer) counts 0))
+                   (funcall original buffer start end))))
+        (org-outlook--apply-sync-batch
+         (org-outlook-test-batch
+          (list (org-outlook-test-event "destination" "old")
+                (org-outlook-test-event "refiled" "old")))
+         nil))
+      (should (= 1 (gethash org-outlook-file counts)))
+      (should (= 1 (gethash refiled counts))))))
+
+(ert-deftest org-outlook-register-creates-destination-directory ()
+  (let* ((directory (make-temp-file "org-outlook-parent-" t))
+         (org-outlook-file
+          (expand-file-name "nested/calendar/outlook.org" directory))
+         (org-agenda-files nil))
+    (unwind-protect
+        (progn
+          (org-outlook--register-agenda-file)
+          (should (file-directory-p (file-name-directory org-outlook-file)))
+          (should (member org-outlook-file org-agenda-files)))
+      (delete-directory directory t))))
+
+(ert-deftest org-outlook-register-rejects-empty-destination ()
+  (let ((org-outlook-file nil))
+    (should-error (org-outlook--register-agenda-file) :type 'user-error)))
+
 (ert-deftest org-outlook-sync-real-duplicate-entries-still-abort ()
   (org-outlook-test-with-files
     (org-outlook-test-append-entry org-outlook-file "duplicate")

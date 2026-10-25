@@ -394,9 +394,42 @@
         (org-outlook-finalize-capture)))))
 
 (ert-deftest org-outlook-capture-template-saves-in-calendar-file ()
-  (let ((template (assoc "o" org-capture-templates)))
-    (should (equal '(file org-outlook-file) (nth 3 template)))
-    (should (plist-get (nthcdr 5 template) :org-outlook))))
+  (let ((org-capture-templates nil)
+        (org-capture-prepare-finalize-hook nil)
+        (org-outlook-capture-key "o"))
+    (org-outlook-install-capture-template)
+    (org-outlook-install-capture-template)
+    (let ((template (assoc "o" org-capture-templates)))
+      (should (= 1 (length org-capture-templates)))
+      (should (equal '(file org-outlook-file) (nth 3 template)))
+      (should (plist-get (nthcdr 5 template) :org-outlook))
+      (should (= 1 (cl-count #'org-outlook-finalize-capture
+                             org-capture-prepare-finalize-hook))))))
+
+(ert-deftest org-outlook-capture-integration-is-opt-in ()
+  (should-not (memq #'org-outlook-finalize-capture
+                    org-capture-prepare-finalize-hook))
+  (should-not (seq-find #'org-outlook--capture-template-p
+                        org-capture-templates)))
+
+(ert-deftest org-outlook-capture-install-rejects-key-collision ()
+  (let ((org-capture-templates '(("o" "Personal" entry (file "notes.org") "* %?")))
+        (org-capture-prepare-finalize-hook nil)
+        (org-outlook-capture-key "o"))
+    (should-error (org-outlook-install-capture-template) :type 'user-error)
+    (should (equal "Personal" (cadr (assoc "o" org-capture-templates))))
+    (should-not org-capture-prepare-finalize-hook)))
+
+(ert-deftest org-outlook-capture-install-moves-configured-key ()
+  (let ((org-capture-templates nil)
+        (org-capture-prepare-finalize-hook nil)
+        (org-outlook-capture-key "o"))
+    (org-outlook-install-capture-template)
+    (setq org-outlook-capture-key "O")
+    (org-outlook-install-capture-template)
+    (should-not (assoc "o" org-capture-templates))
+    (should (org-outlook--capture-template-p
+             (assoc "O" org-capture-templates)))))
 
 (ert-deftest org-outlook-content-join-resolves-parent-url ()
   (with-temp-buffer
@@ -428,7 +461,9 @@
               "* Planning\n:PROPERTIES:\n:MEETING-TIME: <2026-10-22 Thu 09:00-10:00>\n:TEAMS-MEETING: yes\n:END:\nPersonal capture notes\n"
               :org-outlook t)))
           (org-capture-after-finalize-hook nil)
-          (org-capture-before-finalize-hook nil))
+          (org-capture-before-finalize-hook nil)
+          (org-capture-prepare-finalize-hook
+           '(org-outlook-finalize-capture)))
       (cl-letf (((symbol-function 'org-msg-export-as-html) #'identity))
         (org-outlook-test-with-responses (list (org-outlook-test-calendar-response t))
           (unwind-protect
@@ -450,6 +485,8 @@
               :org-outlook t)))
           (org-capture-after-finalize-hook nil)
           (org-capture-before-finalize-hook nil)
+          (org-capture-prepare-finalize-hook
+           '(org-outlook-finalize-capture))
           (original (org-outlook-test-file-text org-outlook-file))
           availability-checked)
       (cl-letf (((symbol-function 'org-msg-export-as-html) #'identity)

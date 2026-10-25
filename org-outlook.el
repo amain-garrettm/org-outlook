@@ -1,11 +1,11 @@
-;;; org-outlook.el --- sync events from outlook calendar to org -*- lexical-binding: t -*-
+;;; org-outlook.el --- Sync Outlook events to Org -*- lexical-binding: t -*-
 
 ;; Copyright (C) 2022 Ian FitzPatrick
 
 ;; Author: Ian FitzPatrick ian@ianfitzpatrick.eu
-;; URL: github.com/ifitzpat/org-outlook
+;; URL: https://github.com/ifitzpat/org-outlook
 ;; Version: 0.1.4
-;; Package-Requires: ((emacs "27.1") (org-ml "6.0.2") (html2org "0.1") (plz "0.10pre") (org-msg "4.0") (web-server "0.1.2"))
+;; Package-Requires: ((emacs "27.1") (org-ml "6.0.2") (html2org "0.1") (plz "0.10pre") (org-msg "4.0"))
 ;; Keywords: calendar outlook org-mode
 
 ;; This file is not part of GNU Emacs
@@ -25,12 +25,13 @@
 
 ;;; Commentary:
 ;;
-;; [FIXME package description]
+;; Synchronize Microsoft Outlook calendar events with an Org file.  The
+;; package supports incremental synchronization, event editing, Teams links,
+;; availability checks, and an optional Org capture template.
 
 ;;; Code:
 
 (require 'org-ml)
-(require 'html2org)
 (require 'cl-lib)
 (require 'json)
 (require 'url-parse)
@@ -40,14 +41,26 @@
 (require 'subr-x)
 (require 'seq)
 (require 'plz)
-(require 'org-msg)
 (require 'plstore)
-(require 'web-server)
+
+(declare-function html2org "html2org" (buffer start end &optional noerror))
+(declare-function org-msg-export-as-html "org-msg" (text))
+(declare-function org-capture-get "org-capture" (property &optional local))
+(declare-function org-capture-kill "org-capture" ())
+(declare-function org-agenda-goto-date "org-agenda" (date))
+(declare-function parse-iso8601-time-string "iso8601" (string))
+(defvar org-capture-templates)
+
+(defgroup org-outlook nil
+  "Synchronize Microsoft Outlook calendar events with Org."
+  :group 'org)
 
 (defconst org-outlook-resource-url "https://graph.microsoft.com/.default")
 (defconst org-outlook-events-url "https://graph.microsoft.com/v1.0/me/calendarview")
 (defconst org-outlook-events-create-url "https://graph.microsoft.com/v1.0/me/calendar/events")
 (defconst org-outlook-schedule-url "https://graph.microsoft.com/v1.0/me/calendar/getSchedule")
+(defconst org-outlook-events-delta-url
+  "https://graph.microsoft.com/v1.0/me/calendarview/delta")
 
 (define-error 'org-outlook-graph-error "Microsoft Graph request failed")
 
@@ -153,23 +166,53 @@ The condition contains a safe message and the typed result."
                     result)))
     (org-outlook-graph-result-data result)))
 
-(defvar org-outlook-local-timezone "Europe/Berlin" "Your timezone")
-(defvar org-outlook-token-cache-file "~/.cache/outlook.plist" "Path to a plist file to keep the encrypted secret tokens")
-(defvar org-outlook-sync-start 14 "How many days 'in the past' should be synced?")
-(defvar org-outlook-sync-end 90 "How many days 'in the future' should be synced?")
-(defvar org-outlook-file "~/.emacs.d/outlook.org")
-(defvar org-outlook-max-page-size 1000
+(defcustom org-outlook-local-timezone "Europe/Berlin"
+  "IANA time zone used for local calendar dates."
+  :type 'string :group 'org-outlook)
+(defcustom org-outlook-token-cache-file
+  (expand-file-name "outlook.plist" "~/.cache/")
+  "File used to store encrypted secret tokens."
+  :type 'file :group 'org-outlook)
+(defcustom org-outlook-sync-start 14
+  "Number of days in the past to synchronize."
+  :type 'integer :group 'org-outlook)
+(defcustom org-outlook-sync-end 90
+  "Number of days in the future to synchronize."
+  :type 'integer :group 'org-outlook)
+(defcustom org-outlook-file (expand-file-name "outlook.org" org-directory)
+  "Org file used as the synchronization destination."
+  :type 'file :group 'org-outlook)
+(defcustom org-outlook-max-page-size 1000
   "Maximum number of events requested per Microsoft Graph page.
 Set to nil to use the server default.  Calendar views accept values from
-1 through 1000; Graph can still return a smaller page and a continuation URL.")
+1 through 1000; Graph can still return a smaller page and a continuation URL."
+  :type '(choice (const :tag "Server default" nil)
+                 (integer :tag "Maximum page size"))
+  :group 'org-outlook)
 
-(defvar org-outlook-client-id "3df0b076-dc9c-48f8-b940-a271ed0bb14b" "Microsoft Entra App Registration Client ID. You can use the default or provide your own if you prefer (see README.org for details)")
-(defvar org-outlook-tenant-id "organizations" "If you provide your own App Registration you can optionally set this to only your outlook tenant (see README.org for details).")
-(defvar org-outlook-user-email nil "Your email address for availability checks. Set this to use org-outlook-i-am-available-p.")
+(defcustom org-outlook-client-id "3df0b076-dc9c-48f8-b940-a271ed0bb14b"
+  "Microsoft Entra application registration client ID."
+  :type 'string :group 'org-outlook)
+(defcustom org-outlook-tenant-id "organizations"
+  "Microsoft Entra tenant ID used for authentication."
+  :type 'string :group 'org-outlook)
+(defcustom org-outlook-user-email nil
+  "Email address used for availability checks."
+  :type '(choice (const :tag "Unset" nil) string)
+  :group 'org-outlook)
 
 (define-error 'org-outlook-auth-error "Outlook authentication failed")
-(defvar org-outlook-gpg-recipient nil "GPG recipient for cached OAuth credentials.")
-(defvar org-outlook-auth-timeout 300 "Seconds to wait for browser authorization.")
+(define-error 'org-outlook-http-error "Invalid Outlook OAuth HTTP request")
+(defcustom org-outlook-gpg-recipient nil
+  "GPG recipient for cached OAuth credentials."
+  :type '(choice (const :tag "Unset" nil) string)
+  :group 'org-outlook)
+(defcustom org-outlook-auth-timeout 300
+  "Seconds to wait for browser authorization."
+  :type 'number :group 'org-outlook)
+(defcustom org-outlook-auth-client-timeout 15
+  "Seconds an incomplete OAuth callback connection may remain idle."
+  :type 'number :group 'org-outlook)
 (defconst org-outlook--redirect-uri "http://localhost:9004")
 (defvar org-outlook--auth-running nil)
 (defvar org-outlook--auth-server nil)
@@ -226,26 +269,156 @@ Wrong state leaves the pending login untouched.  Codes stay in memory."
     '(200 . "Authorization received. Return to Emacs."))
    (t '(400 . "Missing authorization code"))))
 
-(defun process-token-callback (request)
-  "Handle web-server REQUEST without echoing or storing authorization codes."
-  (let* ((path (cdr (assq :GET (ws-headers request))))
-         ;; Parse raw query once: web-server's header parser decodes twice.
-         (raw (car (split-string (ws-pending request) "\r\n")))
-         (query (and (string-match "\\`GET [^ ?]*[?]\\([^ ]*\\) HTTP/" raw)
-                     (match-string 1 raw)))
-         (params (mapcan (lambda (pair)
-                           (mapcar (lambda (value) (cons (car pair) value)) (cdr pair)))
-                         (url-parse-query-string (or query ""))))
-         (reply (org-outlook--oauth-callback (and path 'GET) path params))
-         (process (ws-process request)))
-    (ws-response-header process (car reply)
-                        '("Content-Type" . "text/plain; charset=utf-8")
-                        '("Cache-Control" . "no-store"))
-    (process-send-string process (cdr reply))))
+(defun org-outlook--parse-auth-http-request (request)
+  "Parse the request line and OAuth query parameters from REQUEST.
+Only an HTTP/1.0 or HTTP/1.1 origin-form request is accepted.  Query values
+are decoded exactly once.  Signal `org-outlook-http-error' when malformed."
+  (unless (and (stringp request) (<= (string-bytes request) 8192))
+    (signal 'org-outlook-http-error '("OAuth callback request is too large")))
+  (let* ((line-end (or (string-match "\r?\n" request) (length request)))
+         (line (substring request 0 line-end)))
+    (unless (string-match
+             "\\`\\([A-Z]+\\) \\(/[^ ]*\\) HTTP/1\\.[01]\\'" line)
+      (signal 'org-outlook-http-error '("Malformed OAuth callback request")))
+    (let* ((method (intern (match-string 1 line)))
+           (target (match-string 2 line))
+           (query-start (string-match-p "[?]" target))
+           (path (if query-start (substring target 0 query-start) target))
+           (query (and query-start (substring target (1+ query-start))))
+           params)
+      (condition-case nil
+          (setq params
+                (mapcan
+                 (lambda (pair)
+                   (mapcar (lambda (value) (cons (car pair) value)) (cdr pair)))
+                 (url-parse-query-string (or query ""))))
+        (error
+         (signal 'org-outlook-http-error '("Malformed OAuth callback query"))))
+      (list :method method :path path :params params))))
 
-(defun start-auth-code-server ()
-  "Listen on loopback only, with request logging disabled."
-  (ws-start #'process-token-callback 9004 nil :host "127.0.0.1"))
+(defun org-outlook--handle-auth-http-request (request)
+  "Validate OAuth state from raw HTTP REQUEST and return a safe reply pair."
+  (condition-case nil
+      (let ((parsed (org-outlook--parse-auth-http-request request)))
+        (org-outlook--oauth-callback
+         (plist-get parsed :method)
+         (plist-get parsed :path)
+         (plist-get parsed :params)))
+    (org-outlook-http-error '(400 . "Invalid authorization request"))))
+
+(defun org-outlook--auth-http-response (reply)
+  "Return a complete HTTP response for safe status/body pair REPLY."
+  (let* ((status (car reply))
+         (reason (or (cdr (assq status '((200 . "OK")
+                                         (400 . "Bad Request")
+                                         (404 . "Not Found")
+                                         (409 . "Conflict"))))
+                     "Internal Server Error"))
+         (body (encode-coding-string (cdr reply) 'utf-8)))
+    (concat (format "HTTP/1.1 %d %s\r\n" status reason)
+            "Content-Type: text/plain; charset=utf-8\r\n"
+            (format "Content-Length: %d\r\n" (string-bytes body))
+            "Cache-Control: no-store\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            body)))
+
+(defun org-outlook--send-auth-http-response (process reply)
+  "Send REPLY to PROCESS once, then close the connection."
+  (unless (process-get process 'org-outlook-http-replied)
+    (process-put process 'org-outlook-http-replied t)
+    (unwind-protect
+        (process-send-string process (org-outlook--auth-http-response reply))
+      (if (processp process)
+          (org-outlook--expire-auth-client process)
+        (delete-process process)))))
+
+(defun org-outlook--forget-auth-client (client)
+  "Cancel CLIENT's timer and remove it from its owning listener."
+  (let ((timer (process-get client 'org-outlook-auth-timer))
+        (server (process-get client 'org-outlook-auth-server)))
+    (when (timerp timer) (cancel-timer timer))
+    (process-put client 'org-outlook-auth-timer nil)
+    (when (processp server)
+      (process-put server 'org-outlook-auth-clients
+                   (delq client (process-get server 'org-outlook-auth-clients))))))
+
+(defun org-outlook--auth-client-sentinel (client _event)
+  "Forget OAuth CLIENT after its network state changes."
+  (unless (process-live-p client)
+    (org-outlook--forget-auth-client client)))
+
+(defun org-outlook--expire-auth-client (client)
+  "Close an incomplete OAuth CLIENT connection."
+  (org-outlook--forget-auth-client client)
+  (when (process-live-p client)
+    (delete-process client)))
+
+(defun org-outlook--reset-auth-client-timer (client)
+  "Restart CLIENT's inactivity timer when it belongs to an OAuth listener."
+  (when (process-get client 'org-outlook-auth-server)
+    (let ((timer (process-get client 'org-outlook-auth-timer)))
+      (when (timerp timer) (cancel-timer timer)))
+    (process-put client 'org-outlook-auth-timer
+                 (run-at-time org-outlook-auth-client-timeout nil
+                              #'org-outlook--expire-auth-client client))))
+
+(defun org-outlook--auth-client-log (server client _message)
+  "Register accepted OAuth CLIENT with SERVER for bounded cleanup."
+  (process-put client 'org-outlook-auth-server server)
+  (process-put server 'org-outlook-auth-clients
+               (cons client (process-get server 'org-outlook-auth-clients)))
+  (set-process-sentinel client #'org-outlook--auth-client-sentinel)
+  (org-outlook--reset-auth-client-timer client))
+
+(defun org-outlook--close-auth-listener (server)
+  "Close SERVER and every OAuth client it accepted."
+  (when (processp server)
+    (dolist (client (copy-sequence
+                     (process-get server 'org-outlook-auth-clients)))
+      (org-outlook--expire-auth-client client))
+    (process-put server 'org-outlook-auth-clients nil))
+  ;; Tests and callers may supply a process name instead of an object.
+  (when server (ignore-errors (delete-process server))))
+
+(defun org-outlook--auth-http-filter (process chunk)
+  "Accumulate an OAuth HTTP request from PROCESS and handle CHUNK.
+Requests are bounded to 8192 bytes and handled once their headers finish."
+  (org-outlook--reset-auth-client-timer process)
+  (unless (process-get process 'org-outlook-http-replied)
+    (let ((request (concat (or (process-get process 'org-outlook-http-request) "")
+                           chunk)))
+      (process-put process 'org-outlook-http-request request)
+      (cond
+       ((> (string-bytes request) 8192)
+        (org-outlook--send-auth-http-response
+         process '(400 . "Invalid authorization request")))
+       ((or (string-match-p "\r\n\r\n" request)
+            (string-match-p "\n\n" request))
+        (org-outlook--send-auth-http-response
+         process (org-outlook--handle-auth-http-request request)))))))
+
+(defun org-outlook--make-auth-listener (filter &optional service sentinel)
+  "Create a loopback-only OAuth listener using FILTER.
+SERVICE defaults to the OAuth redirect port; tests may pass t to request an
+available local port.  SENTINEL applies to the listener; accepted clients use
+the package's lifecycle sentinel."
+  (make-network-process
+   :name "org-outlook-auth"
+   :server t
+   :host "127.0.0.1"
+   :service (or service 9004)
+   :family 'ipv4
+   :coding 'binary
+   :filter-multibyte nil
+   :noquery t
+   :filter filter
+   :sentinel sentinel
+   :log #'org-outlook--auth-client-log))
+
+(defun org-outlook--start-auth-code-server ()
+  "Listen for one OAuth callback on the loopback interface."
+  (org-outlook--make-auth-listener #'org-outlook--auth-http-filter))
 
 (defun org-outlook-set-token-field (type public secret)
   "Save PUBLIC and encrypted SECRET under TYPE, closing the store on error."
@@ -284,7 +457,7 @@ Always release the listener and timer, including on cancellation or quit."
                          ("code_challenge" . ,challenge) ("code_challenge_method" . "S256"))))))
     (unwind-protect
         (progn
-          (setq org-outlook--auth-server (start-auth-code-server)
+          (setq org-outlook--auth-server (org-outlook--start-auth-code-server)
                 org-outlook--auth-timer
                 (run-at-time org-outlook-auth-timeout nil
                              (lambda ()
@@ -297,7 +470,7 @@ Always release the listener and timer, including on cancellation or quit."
             (signal 'org-outlook-auth-error (list org-outlook--auth-error)))
           (list :code org-outlook--auth-code :verifier verifier))
       (when org-outlook--auth-timer (cancel-timer org-outlook--auth-timer))
-      (when org-outlook--auth-server (ws-stop org-outlook--auth-server))
+      (org-outlook--close-auth-listener org-outlook--auth-server)
       (setq org-outlook--auth-state nil org-outlook--auth-code nil))))
 
 (defun org-outlook--oauth-cache ()
@@ -339,13 +512,14 @@ Always release the listener and timer, including on cancellation or quit."
               :access (plist-get data :access)))
   (org-outlook--memory-access-token))
 
-(defun token-timed-out (&optional token)
+(defun org-outlook-token-expired-p (&optional token)
   "Use actual access expiry; Microsoft validates refresh-token revocation."
   (if (equal token "refresh")
       (not (plist-get (org-outlook--oauth-cache) :refresh))
     (org-outlook--access-token-expired-p (org-outlook--oauth-cache))))
 
-(defun token-cache-exists ()
+(defun org-outlook-token-cache-exists-p ()
+  "Return non-nil when the configured token cache is a regular file."
   (file-regular-p (expand-file-name org-outlook-token-cache-file)))
 
 (defun org-outlook-access-token ()
@@ -425,8 +599,10 @@ Save rotated credentials and the server's expiry in one encrypted cache write."
   (or (org-outlook-access-token)
       (org-outlook-request-access-token)))
 
-(defvar org-outlook-timezone-aliases nil
-  "Explicit mappings from server time-zone names to installed IANA names.")
+(defcustom org-outlook-timezone-aliases nil
+  "Explicit mappings from server time-zone names to installed IANA names."
+  :type '(alist :key-type string :value-type string)
+  :group 'org-outlook)
 
 (defun org-outlook--timezone (zone)
   "Resolve ZONE without silently treating an unknown IANA name as UTC."
@@ -518,7 +694,9 @@ across a DST transition.  Explicit offsets always identify an instant."
 (defun org-outlook-end-time-from-timestamp (timestamp)
   (org-outlook--timestamp-part timestamp "end"))
 
-(defun org-outlook-update-meeting-id (id) ;; unused?
+;;;###autoload
+(defun org-outlook-update-meeting-id (id)
+  "Set the current Org headline's ID property to ID."
   (interactive)
   (let ((elm (org-ml-parse-element-at (point))))
     (->> elm
@@ -564,6 +742,7 @@ status prefix only when the remaining text exactly matches the subject."
         subject
       title)))
 
+;;;###autoload
 (defun org-outlook-calendar-create-or-update-event ()
   "Create or update the current calendar event and record its returned ID.
 Only new events export their capture body.  Updates never upload personal
@@ -587,6 +766,7 @@ transaction ID so a manual retry after an uncertain response is deduplicated."
          (transaction (unless id (or (org-entry-get nil "OUTLOOK-TRANSACTION-ID")
                                     (org-id-uuid))))
          (body (unless id
+                 (require 'org-msg)
                  (org-msg-export-as-html
                   (buffer-substring-no-properties
                    (save-excursion (org-end-of-meta-data) (point))
@@ -640,9 +820,19 @@ transaction ID so a manual retry after an uncertain response is deduplicated."
       (message "%s Outlook event" (if id "Updated" "Created"))
       data)))
 
+(defun org-outlook--ensure-destination-directory ()
+  "Create the parent directory of `org-outlook-file' when necessary."
+  (unless (and (stringp org-outlook-file)
+               (not (string-empty-p org-outlook-file)))
+    (user-error "org-outlook-file must be a non-empty file name"))
+  (let ((directory (file-name-directory (expand-file-name org-outlook-file))))
+    (unless (file-directory-p directory)
+      (make-directory directory t))))
+
 (defun org-outlook--register-agenda-file ()
   "Register Outlook only for a list-based agenda configuration.
 File-backed agenda lists remain under the user's control."
+  (org-outlook--ensure-destination-directory)
   (when (listp org-agenda-files)
     (add-to-list 'org-agenda-files org-outlook-file)))
 
@@ -655,11 +845,13 @@ File-backed agenda lists remain under the user's control."
     (list (nth 5 parts) (nth 4 parts) (nth 3 parts) (nth 2 parts) (nth 1 parts))))
 
 (defun org-outlook-convert-html-body (html)
+  "Convert HTML to Org markup."
+  (require 'html2org)
   (with-temp-buffer
     (insert html)
     (let ((org-inhibit-startup t)) (org-mode))
     (html2org (current-buffer) (point-min) (point-max) nil)))
-(defun attendee-list (attendees &optional responsefilter)
+(defun org-outlook--attendee-list (attendees &optional responsefilter)
   "Format ATTENDEES whose response matches RESPONSEFILTER."
   (mapconcat
    (lambda (item)
@@ -696,9 +888,12 @@ File-backed agenda lists remain under the user's control."
       ("LOCATION" . ,(alist-get 'displayName (alist-get 'location event)))
       ("URL" . ,(alist-get 'webLink event))
       ("TEAMSURL" . ,(alist-get 'joinUrl (alist-get 'onlineMeeting event)))
-      ("ACCEPTED" . ,(attendee-list (alist-get 'attendees event) "accepted"))
-      ("DECLINED" . ,(attendee-list (alist-get 'attendees event) "declined"))
-      ("NO-RESPONSE" . ,(attendee-list (alist-get 'attendees event) "none")))))
+      ("ACCEPTED" . ,(org-outlook--attendee-list
+                        (alist-get 'attendees event) "accepted"))
+      ("DECLINED" . ,(org-outlook--attendee-list
+                        (alist-get 'attendees event) "declined"))
+      ("NO-RESPONSE" . ,(org-outlook--attendee-list
+                           (alist-get 'attendees event) "none")))))
 
 (defun org-outlook--put-properties (properties)
   "Apply reserved PROPERTIES at the current headline."
@@ -776,9 +971,6 @@ File-backed agenda lists remain under the user's control."
              `(("emailAddress" . (("address" . ,address))) ("type" . "required")))
            (split-string (or attendees-string "") "[ \t\r\n]+" t))))
 
-(defun event-title (event)
-  (assoc-default 'subject event))
-
 (defun org-outlook-teams-installed-p ()
   "Check if Microsoft Teams is installed.
 Returns non-nil if Teams desktop app is detected."
@@ -796,6 +988,7 @@ Returns non-nil if Teams desktop app is detected."
    (and (executable-find "flatpak")
         (eq 0 (call-process "flatpak" nil nil nil "info" "com.microsoft.Teams")))))
 
+;;;###autoload
 (defun org-outlook-join-teams-call ()
   "Join the returned Teams meeting URL from this entry or its event parent."
   (interactive)
@@ -805,36 +998,60 @@ Returns non-nil if Teams desktop app is detected."
     (browse-url (if (org-outlook-teams-installed-p)
                     (concat "msteams:" (substring url (length "https:")))
                   url))))
-(with-eval-after-load 'org-capture
-  (defun org-outlook-capture-template ()
-    "Returns `org-capture' template string for new outlook calendar event.
- See `org-capture-templates' for more information."
-    (let* ((title (read-from-minibuffer "Event title: "))
-           (teams-meeting (y-or-n-p "Include Teams meeting? ")))
-      (mapconcat #'identity
-                 `(
-                   ,(concat "* " (org-outlook--one-line title))
-                   ":PROPERTIES:"
-		   ":INVITEES: %^{Space separated invitees: }"
-		   ,(if teams-meeting
-		        ":LOCATION: Microsoft Teams Meeting"
-		      ":LOCATION: %^{Meeting location: }")
-                   ":MEETING-TIME: %^{Meeting time (e.g. <2026-10-22 Thu 09:00-10:00>): }"
-                   ,(if teams-meeting ":TEAMS-MEETING: yes" ":TEAMS-MEETING: no")
-                   ":END:"
-                   "%?\n")          ;Place the cursor here finally
-                 "\n")))
+(defcustom org-outlook-capture-key "o"
+  "Key used by `org-outlook-install-capture-template'."
+  :type 'string :group 'org-outlook)
 
-  (add-to-list 'org-capture-templates
-               '("o"                ;`org-capture' binding + o
-                 "Outlook calendar event"
-                 entry
-                 (file org-outlook-file)
-                 (function org-outlook-capture-template)
-                 :org-outlook t
-		 :kill-buffer t
-					;		  :prepare-finalize #'org-outlook-finalize-capture
-		 )))
+(defun org-outlook-capture-template ()
+  "Return the `org-capture' template body for a new Outlook event."
+  (let ((title (read-from-minibuffer "Event title: "))
+        (teams-meeting (y-or-n-p "Include Teams meeting? ")))
+    (mapconcat
+     #'identity
+     `(,(concat "* " (org-outlook--one-line title))
+       ":PROPERTIES:"
+       ":INVITEES: %^{Space separated invitees: }"
+       ,(if teams-meeting
+            ":LOCATION: Microsoft Teams Meeting"
+          ":LOCATION: %^{Meeting location: }")
+       ":MEETING-TIME: %^{Meeting time (e.g. <2026-10-22 Thu 09:00-10:00>): }"
+       ,(if teams-meeting ":TEAMS-MEETING: yes" ":TEAMS-MEETING: no")
+       ":END:"
+       "%?\n")
+     "\n")))
+
+(defun org-outlook--capture-template-p (template)
+  "Return non-nil when TEMPLATE belongs to org-outlook."
+  (plist-get (nthcdr 5 template) :org-outlook))
+
+;;;###autoload
+(defun org-outlook-install-capture-template ()
+  "Install the Outlook capture template and finalization hook explicitly.
+Signal `user-error' rather than replacing an unrelated template whose key is
+`org-outlook-capture-key'.  Repeated calls are idempotent, and changing the key
+moves the previously installed Outlook template."
+  (interactive)
+  (require 'org-capture)
+  (unless (and (stringp org-outlook-capture-key)
+               (not (string-empty-p org-outlook-capture-key)))
+    (user-error "org-outlook-capture-key must be a non-empty string"))
+  (org-outlook--ensure-destination-directory)
+  (let ((existing (assoc org-outlook-capture-key org-capture-templates))
+        (template
+         (list org-outlook-capture-key "Outlook calendar event" 'entry
+               '(file org-outlook-file)
+               '(function org-outlook-capture-template)
+               :org-outlook t :kill-buffer t)))
+    (when (and existing (not (org-outlook--capture-template-p existing)))
+      (user-error "Org capture key %s is already in use"
+                  org-outlook-capture-key))
+    (setq org-capture-templates
+          (cl-remove-if #'org-outlook--capture-template-p
+                        org-capture-templates))
+    (add-to-list 'org-capture-templates template)
+    (add-hook 'org-capture-prepare-finalize-hook
+              #'org-outlook-finalize-capture)
+    template))
 
 (defun org-outlook-finalize-capture ()
   "Finalize Outlook captures unless the capture is being aborted."
@@ -848,7 +1065,8 @@ Returns non-nil if Teams desktop app is detected."
         (org-outlook-calendar-create-or-update-event)))))
 
 (defun org-outlook-check-capture-availability ()
-  "Check availability of invitees in current capture and prompt user if conflicts exist.
+  "Check availability of invitees in the current capture.
+Prompt the user if conflicts exist.
 Returns t to proceed with event creation, nil if user wants to edit."
   (let* ((invitees-str (org-entry-get nil "INVITEES"))
          (meeting-time-str (org-entry-get nil "MEETING-TIME")))
@@ -937,6 +1155,7 @@ Perform local decline cleanup only after the server accepts the response."
     (message "Responded to event")
     data))
 
+;;;###autoload
 (defun org-outlook-agenda-goto-meeting ()
   "Open the agenda at this meeting's date in the configured time zone."
   (interactive)
@@ -951,23 +1170,33 @@ Perform local decline cleanup only after the server accepts the response."
     (org-agenda-goto-date date)))
 
 
+;;;###autoload
 (defun org-outlook-accept-event ()
+  "Accept the Outlook event at point."
   (interactive)
   (org-outlook-respond-to-event "accept"))
 
+;;;###autoload
 (defun org-outlook-decline-event ()
+  "Decline the Outlook event at point."
   (interactive)
   (org-outlook-respond-to-event "decline"))
 
+;;;###autoload
 (defun org-outlook-tentatively-accept-event ()
+  "Tentatively accept the Outlook event at point."
   (interactive)
   (org-outlook-respond-to-event "tentativelyAccept"))
 
+;;;###autoload
 (defun org-outlook-cancel-event ()
+  "Cancel the Outlook event at point."
   (interactive)
   (org-outlook-respond-to-event "cancel"))
 
+;;;###autoload
 (defun org-outlook-forward-event ()
+  "Forward the Outlook event at point."
   (interactive)
   (org-outlook-respond-to-event "forward"))
 
@@ -988,9 +1217,6 @@ Perform local decline cleanup only after the server accepts the response."
                  ("name" . ,filename)
                  ("contentBytes" . ,filebytes)))
       (message "Added attachment"))))
-
-(add-hook 'org-capture-prepare-finalize-hook #'org-outlook-finalize-capture)
-(setq org-outlook-events-delta-url "https://graph.microsoft.com/v1.0/me/calendarview/delta")
 
 (defun org-outlook--managed-id-p (id remote)
   "Return non-nil when this entry records ownership of ID and REMOTE.
@@ -1135,10 +1361,13 @@ otherwise NEXTLINK or the saved cursor continues the existing view."
           (signal 'org-outlook-graph-error '("Invalid Graph continuation URL")))))
     (apply #'append (nreverse chunks))))
 
-(defvar org-outlook-full-sync-interval-days 7
+(defcustom org-outlook-full-sync-interval-days 7
   "Number of days between full syncs for validation.
 Set to nil to disable periodic full syncs.  A changed date window always
-requires a new full sync because Graph cursors encode a fixed date range.")
+requires a new full sync because Graph cursors encode a fixed date range."
+  :type '(choice (const :tag "Disabled" nil)
+                 (integer :tag "Days"))
+  :group 'org-outlook)
 
 (defvar org-outlook--sync-running nil
   "Non-nil while a sync is fetching, applying, or committing changes.")
@@ -1324,17 +1553,30 @@ Legacy body text is retained in a commented child on first migration."
            nil nil)
           entries)))))
 
-(defun org-outlook--legacy-id-map (start end)
+(defun org-outlook--scan-managed-entries (start end)
+  "Return BUFFER/ENTRY pairs for all managed entries in the sync files.
+Each file is parsed exactly once for the calendar window START through END."
+  (let (entries)
+    (dolist (file (org-outlook--sync-files))
+      (when (or (equal file (expand-file-name org-outlook-file))
+                (file-exists-p file))
+        (let ((buffer (find-file-noselect file)))
+          (with-current-buffer buffer
+            (unless (derived-mode-p 'org-mode) (org-mode)))
+          (dolist (entry (org-outlook--managed-entries buffer start end))
+            (push (cons buffer entry) entries)))))
+    (nreverse entries)))
+
+(defun org-outlook--legacy-id-map (entries)
   "Translate existing mutable IDs before associating a new immutable snapshot.
+ENTRIES contains BUFFER/ENTRY pairs from `org-outlook--scan-managed-entries'.
 Do not change files if translation is denied or incomplete.  Keep old Org
 IDs so existing links survive.  Translation requires delegated User.Read."
   (let (ids (mapping (make-hash-table :test #'equal)))
-    (dolist (file (org-outlook--sync-files))
-      (when (file-exists-p file)
-        (let ((buffer (find-file-noselect file)))
-          (dolist (entry (org-outlook--managed-entries buffer start end))
-            (unless (equal "immutable" (plist-get entry :id-type))
-              (push (plist-get entry :id) ids))))))
+    (dolist (local entries)
+      (let ((entry (cdr local)))
+        (unless (equal "immutable" (plist-get entry :id-type))
+          (push (plist-get entry :id) ids))))
     (setq ids (delete-dups ids))
     (while ids
       (let* ((batch (seq-take ids 1000))
@@ -1362,41 +1604,42 @@ be retried safely from the previous cursor."
         (locals (make-hash-table :test #'equal))
         (start (org-outlook-sync-batch-start batch))
         (end (org-outlook-sync-batch-end batch))
-        edits buffers groups saved accepted migrations)
+        edits buffers groups saved accepted migrations local-entries)
     ;; Delta rounds can mention an ID more than once; the final version wins.
     (dolist (event (org-outlook-sync-batch-events batch))
       (let ((id (alist-get 'id event)))
         (unless (and (stringp id) (not (string-empty-p id)))
           (signal 'org-outlook-graph-error '("Event has no valid Graph ID")))
         (puthash id event events)))
-    (setq migrations (org-outlook--legacy-id-map start end))
-    (dolist (file (org-outlook--sync-files))
-      (when (or (equal file (expand-file-name org-outlook-file)) (file-exists-p file))
-        (let ((buffer (find-file-noselect file)))
-          (with-current-buffer buffer
-            (unless (derived-mode-p 'org-mode) (org-mode)))
-          (dolist (entry (org-outlook--managed-entries buffer start end))
-            (let* ((id (plist-get entry :id))
-                   (canonical (or (gethash id migrations) id))
-                   (event (gethash canonical events))
-                   (remove (and (not (plist-get entry :deleted))
-                                (plist-get entry :in-window)
-                                (or (alist-get '@removed event)
-                                    (and full (not event))))))
-              (when (gethash canonical locals)
-                (error "Duplicate managed Outlook ID in local files: %s" id))
-              (puthash canonical (cons buffer entry) locals)
-              (cond
-               (remove
-                (setq edits (append (org-outlook--entry-edits buffer entry nil) edits)))
-               ((and event (not (alist-get '@removed event))
-                     (or (not (plist-get entry :version))
-                         (gethash id migrations)
-                         (not (plist-get entry :child))
-                         (not (equal org-outlook-local-timezone (plist-get entry :timezone)))
-                         (plist-get entry :deleted)
-                         (not (equal (alist-get 'changeKey event) (plist-get entry :change)))))
-                (setq edits (append (org-outlook--entry-edits buffer entry event) edits)))))))))
+    (setq local-entries (org-outlook--scan-managed-entries start end)
+          migrations (org-outlook--legacy-id-map local-entries))
+    (dolist (local local-entries)
+      (let* ((buffer (car local))
+             (entry (cdr local))
+             (id (plist-get entry :id))
+             (canonical (or (gethash id migrations) id))
+             (event (gethash canonical events))
+             (remove (and (not (plist-get entry :deleted))
+                          (plist-get entry :in-window)
+                          (or (alist-get '@removed event)
+                              (and full (not event))))))
+        (when (gethash canonical locals)
+          (error "Duplicate managed Outlook ID in local files: %s" id))
+        (puthash canonical local locals)
+        (cond
+         (remove
+          (setq edits (append (org-outlook--entry-edits buffer entry nil) edits)))
+         ((and event (not (alist-get '@removed event))
+               (or (not (plist-get entry :version))
+                   (gethash id migrations)
+                   (not (plist-get entry :child))
+                   (not (equal org-outlook-local-timezone
+                               (plist-get entry :timezone)))
+                   (plist-get entry :deleted)
+                   (not (equal (alist-get 'changeKey event)
+                               (plist-get entry :change)))))
+          (setq edits
+                (append (org-outlook--entry-edits buffer entry event) edits))))))
     (maphash
      (lambda (id event)
        (unless (or (gethash id locals) (alist-get '@removed event))
@@ -1468,12 +1711,14 @@ be retried safely from the previous cursor."
             (set-buffer-modified-p t)
             (save-buffer)))))))
 
+;;;###autoload
 (defun org-outlook-init-delta-link ()
   "Initialize delta tracking through a reconciled full synchronization.
 Never establish a baseline without applying its events."
   (interactive)
   (org-outlook-full-sync))
 
+;;;###autoload
 (defun org-outlook-full-sync ()
   "Reconcile the current date window using a complete initial delta round."
   (interactive)
@@ -1497,6 +1742,7 @@ Never establish a baseline without applying its events."
     (org-outlook--commit-sync batch nil)
     (message "Delta Outlook sync complete")))
 
+;;;###autoload
 (defun org-outlook-sync (&optional force-full)
   "Synchronize Outlook, using a full view when FORCE-FULL is non-nil.
 Rebuild the view when its date range changes or its cursor expires.
@@ -1530,7 +1776,9 @@ Other fetch or local errors propagate without advancing the saved cursor."
              (signal (car err) (cdr err)))))))))
 
 
-(defun org-outlook-check-availability (schedules start-time end-time &optional availability-interval)
+;;;###autoload
+(defun org-outlook-check-availability
+    (schedules start-time end-time &optional availability-interval)
   "Check SCHEDULES between START-TIME and END-TIME.
 AVAILABILITY-INTERVAL defaults to 30 minutes.  Signal on Graph failure."
   (interactive
