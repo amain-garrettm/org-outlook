@@ -127,6 +127,10 @@ Installing with [[https://framagit.org/steckerhalter/quelpa][Quelpa]] is easy:
   (setq org-outlook-sync-start 14)  ; days in the past to keep in sync
   (setq org-outlook-sync-end 90)    ; days in the future to keep in sync
 
+  ;; Optional: Request larger Graph pages (1-1000, default: 1000)
+  (setq org-outlook-max-page-size 1000)
+  ;(setq org-outlook-max-page-size nil) ; use the server default
+
   ;; Optional: Customize full sync frequency (default: 7 days)
   (setq org-outlook-full-sync-interval-days 7)  ; weekly validation
   ;(setq org-outlook-full-sync-interval-days 14) ; bi-weekly validation

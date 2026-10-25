@@ -158,6 +158,10 @@ The condition contains a safe message and the typed result."
 (defvar org-outlook-sync-start 14 "How many days 'in the past' should be synced?")
 (defvar org-outlook-sync-end 90 "How many days 'in the future' should be synced?")
 (defvar org-outlook-file "~/.emacs.d/outlook.org")
+(defvar org-outlook-max-page-size 1000
+  "Maximum number of events requested per Microsoft Graph page.
+Set to nil to use the server default.  Calendar views accept values from
+1 through 1000; Graph can still return a smaller page and a continuation URL.")
 
 (defvar org-outlook-client-id "3df0b076-dc9c-48f8-b940-a271ed0bb14b" "Microsoft Entra App Registration Client ID. You can use the default or provide your own if you prefer (see README.org for details)")
 (defvar org-outlook-tenant-id "organizations" "If you provide your own App Registration you can optionally set this to only your outlook tenant (see README.org for details).")
@@ -174,6 +178,8 @@ The condition contains a safe message and the typed result."
 (defvar org-outlook--auth-code nil)
 (defvar org-outlook--auth-error nil)
 (defvar org-outlook--auth-complete nil)
+(defvar org-outlook--access-token-cache nil
+  "In-memory plist containing only the current short-lived access token.")
 
 (defun org-outlook--oauth-url (operation)
   "Build the current tenant's OAuth OPERATION URL at request time."
@@ -245,6 +251,8 @@ Wrong state leaves the pending login untouched.  Codes stay in memory."
   "Save PUBLIC and encrypted SECRET under TYPE, closing the store on error."
   (let* ((file (expand-file-name org-outlook-token-cache-file))
          (plstore-encrypt-to org-outlook-gpg-recipient) cache)
+    (when (equal type "oauth")
+      (setq org-outlook--access-token-cache nil))
     (when (and secret (not org-outlook-gpg-recipient))
       (user-error "Set org-outlook-gpg-recipient before saving OAuth credentials"))
     (make-directory (file-name-directory file) t)
@@ -302,21 +310,49 @@ Always release the listener and timer, including on cancellation or quit."
             data))
       (plstore-close cache))))
 
+(defun org-outlook--access-token-expired-p (data)
+  "Return non-nil when access-token DATA is absent, stale, or malformed."
+  (let ((access (plist-get data :access))
+        (expires (plist-get data :expires)))
+    (or (not (and (stringp access) (not (string-empty-p access))))
+        (not expires)
+        (condition-case nil
+            (not (time-less-p (current-time) (parse-iso8601-time-string expires)))
+          (error t)))))
+
+(defun org-outlook--memory-access-token ()
+  "Return a valid in-memory access token for the current tenant and client."
+  (let ((data org-outlook--access-token-cache))
+    (if (and (equal org-outlook-client-id (plist-get data :client))
+             (equal org-outlook-tenant-id (plist-get data :tenant))
+             (not (org-outlook--access-token-expired-p data)))
+        (plist-get data :access)
+      (setq org-outlook--access-token-cache nil)
+      nil)))
+
+(defun org-outlook--remember-access-token (data)
+  "Remember the short-lived access token fields from OAuth DATA."
+  (setq org-outlook--access-token-cache
+        (list :client org-outlook-client-id
+              :tenant org-outlook-tenant-id
+              :expires (plist-get data :expires)
+              :access (plist-get data :access)))
+  (org-outlook--memory-access-token))
+
 (defun token-timed-out (&optional token)
   "Use actual access expiry; Microsoft validates refresh-token revocation."
   (if (equal token "refresh")
       (not (plist-get (org-outlook--oauth-cache) :refresh))
-    (let ((expires (plist-get (org-outlook--oauth-cache) :expires)))
-      (or (not expires)
-          (condition-case nil
-              (not (time-less-p (current-time) (parse-iso8601-time-string expires)))
-            (error t))))))
+    (org-outlook--access-token-expired-p (org-outlook--oauth-cache))))
 
 (defun token-cache-exists ()
   (file-regular-p (expand-file-name org-outlook-token-cache-file)))
 
 (defun org-outlook-access-token ()
-  (plist-get (org-outlook--oauth-cache) :access))
+  (or (org-outlook--memory-access-token)
+      (let ((data (org-outlook--oauth-cache)))
+        (unless (org-outlook--access-token-expired-p data)
+          (org-outlook--remember-access-token data)))))
 
 (defun org-outlook-refresh-token ()
   (plist-get (org-outlook--oauth-cache) :refresh))
@@ -367,25 +403,27 @@ Save rotated credentials and the server's expiry in one encrypted cache write."
       (unless (and (stringp access) (not (string-empty-p access))
                    (numberp lifetime) (> lifetime 0))
         (signal 'org-outlook-auth-error '("Invalid token response")))
-      (org-outlook-set-token-field
-       "oauth"
-       (list :client org-outlook-client-id :tenant org-outlook-tenant-id
-             :expires (format-time-string
-                       "%Y-%m-%dT%H:%M:%SZ"
-                       (time-add (current-time)
-                                 (seconds-to-time (- lifetime (min 30 (/ lifetime 2))))) t))
-       (list :access access :refresh (or (alist-get 'refresh_token data) refresh)))
-      access)))
+      (let ((public
+             (list :client org-outlook-client-id :tenant org-outlook-tenant-id
+                   :expires (format-time-string
+                             "%Y-%m-%dT%H:%M:%SZ"
+                             (time-add (current-time)
+                                       (seconds-to-time
+                                        (- lifetime (min 30 (/ lifetime 2))))) t))))
+        (org-outlook-set-token-field
+         "oauth" public
+         (list :access access :refresh (or (alist-get 'refresh_token data) refresh)))
+        (org-outlook--remember-access-token (append public (list :access access)))))))
 
 (defun org-outlook-force-token-refresh ()
   "Refresh access once without logging credentials."
+  (setq org-outlook--access-token-cache nil)
   (org-outlook-request-access-token))
 
 (defun org-outlook-bearer-token ()
   "Return a usable access token without logging credentials."
-  (if (or (token-timed-out) (not (org-outlook-access-token)))
-      (org-outlook-request-access-token)
-    (org-outlook-access-token)))
+  (or (org-outlook-access-token)
+      (org-outlook-request-access-token)))
 
 (defvar org-outlook-timezone-aliases nil
   "Explicit mappings from server time-zone names to installed IANA names.")
@@ -998,6 +1036,21 @@ Only values are percent-encoded; parameter names are kept literal."
      (concat (car pair) "=" (url-hexify-string (cdr pair))))
    params "&"))
 
+(defun org-outlook--page-size ()
+  "Return the validated configured Graph page size, or nil."
+  (when (and org-outlook-max-page-size
+             (not (and (integerp org-outlook-max-page-size)
+                       (<= 1 org-outlook-max-page-size 1000))))
+    (user-error "org-outlook-max-page-size must be nil or an integer from 1 through 1000"))
+  org-outlook-max-page-size)
+
+(defun org-outlook--delta-preference ()
+  "Return the Graph Prefer value used while retrieving delta pages."
+  (let ((page-size (org-outlook--page-size)))
+    (concat "outlook.timezone=\"UTC\""
+            (when page-size
+              (format ", odata.maxpagesize=%d" page-size)))))
+
 (defun org-outlook-retrieve-events-delta (&optional nextlink start end)
   "Retrieve a delta page, following NEXTLINK verbatim when supplied.
 START and END fix the dates of an initial round even across midnight."
@@ -1007,7 +1060,7 @@ START and END fix the dates of an initial round even across midnight."
                     (org-outlook--build-query-string
                      `(("startDateTime" . ,(org-outlook--utc-string (org-outlook--window-boundary (or start (org-outlook-start)))))
                        ("endDateTime" . ,(org-outlook--utc-string (org-outlook--window-boundary (or end (org-outlook-end)) t)))))))
-   :headers '(("Prefer" . "outlook.timezone=\"UTC\""))))
+   :headers `(("Prefer" . ,(org-outlook--delta-preference)))))
 
 (defun org-outlook-last-delta ()
   (let*
@@ -1055,13 +1108,17 @@ otherwise NEXTLINK or the saved cursor continues the existing view."
 
 (defun org-outlook-retrieve-events (&optional nextlink)
   "Retrieve a calendar page, following NEXTLINK verbatim when supplied."
-  (org-outlook--graph-data
-   'get (or nextlink
-            (concat org-outlook-events-url "?"
-                    (org-outlook--build-query-string
-                     `(("startDateTime" . ,(org-outlook--utc-string (org-outlook--window-boundary (org-outlook-start))))
-                       ("endDateTime" . ,(org-outlook--utc-string (org-outlook--window-boundary (org-outlook-end) t)))))))
-   :headers '(("Prefer" . "outlook.timezone=\"UTC\""))))
+  (let ((page-size (org-outlook--page-size)))
+    (org-outlook--graph-data
+     'get (or nextlink
+              (concat org-outlook-events-url "?"
+                      (org-outlook--build-query-string
+                       (append
+                        `(("startDateTime" . ,(org-outlook--utc-string (org-outlook--window-boundary (org-outlook-start))))
+                          ("endDateTime" . ,(org-outlook--utc-string (org-outlook--window-boundary (org-outlook-end) t))))
+                        (when page-size
+                          `(("$top" . ,(number-to-string page-size))))))))
+     :headers '(("Prefer" . "outlook.timezone=\"UTC\"")))))
 
 (defun org-outlook-retrieve-pages (&optional nextlink)
   "Return every calendar event, requesting complete continuation URLs."

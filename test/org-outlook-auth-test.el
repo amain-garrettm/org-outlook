@@ -183,5 +183,38 @@
              (lambda () '(:access "OLD" :expires "not-a-date"))))
     (should (token-timed-out))))
 
+(ert-deftest org-outlook-auth-access-token-is-cached-in-memory ()
+  (let ((org-outlook--access-token-cache nil)
+        (expires (format-time-string "%Y-%m-%dT%H:%M:%SZ"
+                                     (time-add (current-time) 3600) t))
+        (reads 0))
+    (cl-letf (((symbol-function 'org-outlook--oauth-cache)
+               (lambda ()
+                 (cl-incf reads)
+                 (list :client org-outlook-client-id :tenant org-outlook-tenant-id
+                       :expires expires :access "ACCESS" :refresh "REFRESH"))))
+      (should (equal "ACCESS" (org-outlook-bearer-token)))
+      (should (equal "ACCESS" (org-outlook-bearer-token)))
+      (should (= 1 reads))
+      (should-not (plist-member org-outlook--access-token-cache :refresh)))))
+
+(ert-deftest org-outlook-auth-memory-cache-is-scoped-and-refresh-invalidates ()
+  (let ((org-outlook--access-token-cache
+         (list :client "old" :tenant "old" :expires "2999-01-01T00:00:00Z"
+               :access "OLD"))
+        (reads 0))
+    (cl-letf (((symbol-function 'org-outlook--oauth-cache)
+               (lambda ()
+                 (cl-incf reads)
+                 (list :client org-outlook-client-id :tenant org-outlook-tenant-id
+                       :expires "2999-01-01T00:00:00Z" :access "CURRENT"))))
+      (should (equal "CURRENT" (org-outlook-bearer-token)))
+      (should (= 1 reads)))
+    (cl-letf (((symbol-function 'org-outlook-request-access-token)
+               (lambda ()
+                 (should-not org-outlook--access-token-cache)
+                 "FRESH")))
+      (should (equal "FRESH" (org-outlook-force-token-refresh))))))
+
 (provide 'org-outlook-auth-test)
 ;;; org-outlook-auth-test.el ends here

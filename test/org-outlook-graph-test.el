@@ -192,7 +192,26 @@ Expose CALLS and REFRESHES to BODY.  No network or token cache is used."
   (org-outlook-test-with-responses (list (org-outlook-test-response 200 "{\"value\":[]}"))
     (org-outlook-retrieve-events)
     (should (equal "IdType=\\\"ImmutableId\\\", outlook.timezone=\\\"UTC\\\""
-                   (cdr (assoc "Prefer" (plist-get (nth 2 (car calls)) :headers)))))))
+                   (cdr (assoc "Prefer" (plist-get (nth 2 (car calls)) :headers)))))
+    (should (string-match-p "[?&]\\$top=1000\\(?:&\\|$\\)" (nth 1 (car calls))))))
+
+(ert-deftest org-outlook-graph-page-size-applies-to-delta-and-can-be-disabled ()
+  (org-outlook-test-with-responses
+      (list (org-outlook-test-response
+             200 "{\"value\":[],\"@odata.deltaLink\":\"https://graph.microsoft.com/delta\"}"))
+    (org-outlook-retrieve-events-delta)
+    (should (string-match-p
+             "odata.maxpagesize=1000"
+             (cdr (assoc "Prefer" (plist-get (nth 2 (car calls)) :headers))))))
+  (let ((org-outlook-max-page-size nil))
+    (org-outlook-test-with-responses (list (org-outlook-test-response 200 "{\"value\":[]}"))
+      (org-outlook-retrieve-events)
+      (should-not (string-match-p "[?&]\\$top=" (nth 1 (car calls)))))))
+
+(ert-deftest org-outlook-graph-page-size-is-validated ()
+  (dolist (value '(0 1001 "100"))
+    (let ((org-outlook-max-page-size value))
+      (should-error (org-outlook--page-size) :type 'user-error))))
 
 (provide 'org-outlook-graph-test)
 ;;; org-outlook-graph-test.el ends here
